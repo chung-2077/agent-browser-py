@@ -1,0 +1,13 @@
+[project]
+name = "agent-browser-py"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "playwright>=1.40.0",
+    "websockets>=12.0",
+]
+
+[project.scripts]
+agent-browser = "main:cli"
