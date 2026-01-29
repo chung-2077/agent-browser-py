@@ -13,6 +13,305 @@ from .storage import cookies_clear, cookies_get, cookies_set, storage_clear, sto
 from .streaming import StreamServer
 
 
+STEALTH_JS = """
+// =================================================================================
+// 0. Debug & Safety Wrapper
+// =================================================================================
+console.log("Stealth script starting...");
+window.__stealth_debug = [];
+
+function safeStealth(name, fn) {
+    try {
+        fn();
+        window.__stealth_debug.push(name + ": success");
+    } catch (e) {
+        console.error("Stealth error in " + name, e);
+        window.__stealth_debug.push(name + ": error - " + e.message);
+    }
+}
+
+// =================================================================================
+// 1. User Agent & App Version Override
+// =================================================================================
+safeStealth("webdriver_override", () => {
+    // Remove webdriver property completely
+    // Accessing the property directly on prototype might trigger Illegal invocation if it's a getter requiring an instance
+    // So we use getOwnPropertyDescriptor to check existence safely
+    const newProto = Navigator.prototype;
+    if (newProto) {
+        const desc = Object.getOwnPropertyDescriptor(newProto, 'webdriver');
+        if (desc) {
+            delete newProto.webdriver;
+        }
+    }
+    if (Object.getOwnPropertyDescriptor(navigator, 'webdriver')) {
+        delete navigator.webdriver;
+    }
+});
+
+// =================================================================================
+// 2. Chrome Object Mock
+// =================================================================================
+safeStealth("chrome_mock", () => {
+    if (!window.chrome) {
+        window.chrome = {
+            app: {
+                isInstalled: false,
+                InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+                RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' }
+            },
+            runtime: {
+                OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+                OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
+                PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+                PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
+                RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' }
+            },
+            loadTimes: function() {
+                return {
+                    requestTime: new Date().getTime() / 1000,
+                    startLoadTime: new Date().getTime() / 1000,
+                    commitLoadTime: new Date().getTime() / 1000,
+                    finishDocumentLoadTime: new Date().getTime() / 1000,
+                    finishLoadTime: new Date().getTime() / 1000,
+                    firstPaintTime: new Date().getTime() / 1000,
+                    firstPaintAfterLoadTime: 0,
+                    navigationType: 'Other',
+                    wasFetchedViaSpdy: false,
+                    wasNpnNegotiated: false,
+                    npnNegotiatedProtocol: '',
+                    wasAlternateProtocolAvailable: false,
+                    connectionInfo: 'unknown'
+                };
+            },
+            csi: function() {
+                return { startE: new Date().getTime(), onloadT: new Date().getTime(), pageT: new Date().getTime(), tran: 15 };
+            }
+        };
+    }
+});
+
+// =================================================================================
+// 3. Permissions API
+// =================================================================================
+safeStealth("permissions_mock", () => {
+    const originalQuery = window.navigator.permissions.query;
+    window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications' ?
+        Promise.resolve({ state: Notification.permission }) :
+        originalQuery(parameters)
+    );
+});
+
+// =================================================================================
+// 4. Plugins & MimeTypes (Advanced Mock)
+// =================================================================================
+safeStealth("plugins_mock", () => {
+    // Always overwrite to ensure consistency
+    const pluginsData = [
+        {
+            name: "Chrome PDF Plugin",
+            filename: "internal-pdf-viewer",
+            description: "Portable Document Format",
+            mimeTypes: [{ type: "application/pdf", suffixes: "pdf", description: "Portable Document Format" }, { type: "text/pdf", suffixes: "pdf", description: "Portable Document Format" }]
+        },
+        {
+            name: "Chrome PDF Viewer",
+            filename: "mhjfbmdgcfjbbpaeojofohoefgiehjai",
+            description: "",
+            mimeTypes: [{ type: "application/pdf", suffixes: "pdf", description: "Portable Document Format" }]
+        },
+        {
+            name: "Native Client",
+            filename: "internal-nacl-plugin",
+            description: "",
+            mimeTypes: [{ type: "application/x-nacl", suffixes: "", description: "Native Client Executable" }, { type: "application/x-pnacl", suffixes: "", description: "Portable Native Client Executable" }]
+        }
+    ];
+
+    const plugins = [];
+    const mimeTypes = [];
+    
+    pluginsData.forEach(data => {
+        const plugin = Object.create(Plugin.prototype);
+        Object.defineProperties(plugin, {
+            name: { value: data.name, enumerable: true },
+            filename: { value: data.filename, enumerable: true },
+            description: { value: data.description, enumerable: true },
+            length: { value: data.mimeTypes.length, enumerable: true },
+        });
+        data.mimeTypes.forEach((mimeData, index) => {
+            const mimeType = Object.create(MimeType.prototype);
+            Object.defineProperties(mimeType, {
+                type: { value: mimeData.type, enumerable: true },
+                suffixes: { value: mimeData.suffixes, enumerable: true },
+                description: { value: mimeData.description, enumerable: true },
+                enabledPlugin: { value: plugin, enumerable: true },
+            });
+            Object.defineProperty(plugin, index, { value: mimeType, enumerable: true });
+            Object.defineProperty(plugin, mimeData.type, { value: mimeType, enumerable: false });
+            mimeTypes.push(mimeType);
+        });
+        plugins.push(plugin);
+    });
+    
+    const fakePluginArray = Object.create(PluginArray.prototype);
+    Object.defineProperties(fakePluginArray, {
+        length: { value: plugins.length, enumerable: true },
+        item: { value: (index) => plugins[index], enumerable: false },
+        namedItem: { value: (name) => plugins.find(p => p.name === name), enumerable: false },
+        refresh: { value: () => {}, enumerable: false }
+    });
+    // Fix toString tag
+    if (window.Symbol && Symbol.toStringTag) {
+        Object.defineProperty(fakePluginArray, Symbol.toStringTag, { value: 'PluginArray' });
+    }
+
+    plugins.forEach((p, i) => {
+        Object.defineProperty(fakePluginArray, i, { value: p, enumerable: true });
+        Object.defineProperty(fakePluginArray, p.name, { value: p, enumerable: false });
+    });
+    
+    const fakeMimeTypeArray = Object.create(MimeTypeArray.prototype);
+    Object.defineProperties(fakeMimeTypeArray, {
+        length: { value: mimeTypes.length, enumerable: true },
+        item: { value: (index) => mimeTypes[index], enumerable: false },
+        namedItem: { value: (name) => mimeTypes.find(m => m.type === name), enumerable: false }
+    });
+    // Fix toString tag
+    if (window.Symbol && Symbol.toStringTag) {
+        Object.defineProperty(fakeMimeTypeArray, Symbol.toStringTag, { value: 'MimeTypeArray' });
+    }
+
+    mimeTypes.forEach((m, i) => {
+        Object.defineProperty(fakeMimeTypeArray, i, { value: m, enumerable: true });
+        // Prevent collision if multiple plugins handle same mimetype
+        if (!Object.getOwnPropertyDescriptor(fakeMimeTypeArray, m.type)) {
+            Object.defineProperty(fakeMimeTypeArray, m.type, { value: m, enumerable: false });
+        }
+    });
+    
+    // Debug info
+    window.__debug_plugins_len = fakePluginArray.length;
+    
+    // Use Navigator.prototype to avoid hasOwnProperty detection
+    Object.defineProperty(Navigator.prototype, 'plugins', { 
+        get: () => fakePluginArray, 
+        enumerable: true, 
+        configurable: true 
+    });
+    
+    Object.defineProperty(Navigator.prototype, 'mimeTypes', { 
+        get: () => fakeMimeTypeArray, 
+        enumerable: true, 
+        configurable: true 
+    });
+});
+
+// =================================================================================
+// 5. WebGL Fingerprint Override (WebGL 1 & 2)
+// =================================================================================
+safeStealth("webgl_mock", () => {
+    const overrideWebGL = (contextType) => {
+        if (!window[contextType]) return;
+        const getParameter = window[contextType].prototype.getParameter;
+        window[contextType].prototype.getParameter = function(parameter) {
+            // 37445: UNMASKED_VENDOR_WEBGL
+            // 37446: UNMASKED_RENDERER_WEBGL
+            if (parameter === 37445) return 'Intel Inc.';
+            if (parameter === 37446) return 'Intel(R) Iris(R) Xe Graphics';
+            return getParameter.apply(this, arguments);
+        };
+    };
+    overrideWebGL('WebGLRenderingContext');
+    overrideWebGL('WebGL2RenderingContext');
+});
+
+// =================================================================================
+// 6. Hardware Concurrency & Memory
+// =================================================================================
+safeStealth("hardware_mock", () => {
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+});
+
+// =================================================================================
+// 7. Canvas Noise (2D)
+// =================================================================================
+safeStealth("canvas_noise", () => {
+    const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+    
+    // Generate stable noise for this session
+    // We use a small shift to keep the image looking correct but having a different hash
+    const shift = {
+        r: Math.floor(Math.random() * 10) - 5,
+        g: Math.floor(Math.random() * 10) - 5,
+        b: Math.floor(Math.random() * 10) - 5,
+        a: Math.floor(Math.random() * 10) - 5
+    };
+    // Ensure at least one component has some noise to guarantee unique hash
+    if (shift.r === 0 && shift.g === 0 && shift.b === 0 && shift.a === 0) {
+        shift.r = 1;
+    }
+
+    const applyNoise = (data) => {
+        // Apply noise to pixel data
+        for (let i = 0; i < data.length; i += 4) {
+            // R
+            data[i] = Math.min(255, Math.max(0, data[i] + shift.r));
+            // G
+            data[i+1] = Math.min(255, Math.max(0, data[i+1] + shift.g));
+            // B
+            data[i+2] = Math.min(255, Math.max(0, data[i+2] + shift.b));
+            // A (Optional, usually we don't touch alpha to avoid transparency issues, but safe to shift slightly)
+            // data[i+3] = Math.min(255, Math.max(0, data[i+3] + shift.a));
+        }
+    };
+
+    CanvasRenderingContext2D.prototype.getImageData = function(x, y, w, h) {
+        try {
+            const imageData = originalGetImageData.apply(this, arguments);
+            applyNoise(imageData.data);
+            return imageData;
+        } catch (e) {
+            // CORS or other errors
+            throw e;
+        }
+    };
+
+    HTMLCanvasElement.prototype.toDataURL = function(type, encoderOptions) {
+        try {
+            // Only interfere if we can get a 2D context to read data
+            // If it's a WebGL canvas, this returns null
+            const context = this.getContext("2d");
+            if (context) {
+                const width = this.width;
+                const height = this.height;
+                const imageData = originalGetImageData.call(context, 0, 0, width, height);
+                applyNoise(imageData.data);
+                
+                // Create a temporary canvas to export the noisy data
+                const tempCanvas = document.createElement("canvas");
+                tempCanvas.width = width;
+                tempCanvas.height = height;
+                const tempCtx = tempCanvas.getContext("2d");
+                tempCtx.putImageData(imageData, 0, 0);
+                
+                return originalToDataURL.call(tempCanvas, type, encoderOptions);
+            }
+        } catch (e) {
+            // Fallback to original if anything fails (e.g. CORS tainted)
+        }
+        return originalToDataURL.apply(this, arguments);
+    };
+});
+
+console.log("Stealth script finished");
+"""
+
+
 @dataclass
 class PageState:
     page: Page
@@ -78,13 +377,46 @@ class AgentBrowser:
         if self._browser:
             return
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(headless=self._headless)
+
+        args = [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-infobars",
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--ignore-gpu-blocklist",
+            "--use-gl=angle",
+            "--use-angle=gl",
+            "--no-first-run",
+            "--no-zygote",
+        ]
+
+        self._browser = await self._playwright.chromium.launch(
+            headless=self._headless,
+            args=args,
+            ignore_default_args=["--enable-automation"],
+        )
+        
+        # 如果未指定 user_agent，则使用去除 Headless 标记的默认 UA
+        if not self._user_agent:
+            # 简单策略：先获取当前的默认 UA，然后替换
+            # 但这里我们无法直接获取（需要 page），所以我们硬编码一个现代 Chrome Mac UA
+            # 或者，我们可以启动一个临时页面获取它，但那样太慢。
+            # 最佳实践：硬编码一个较新的稳定版 UA。
+            self._user_agent = (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/121.0.0.0 Safari/537.36"
+            )
+
         self._context = await self._browser.new_context(
             viewport={"width": self._viewport[0], "height": self._viewport[1]},
             user_agent=self._user_agent,
             locale=self._locale,
             timezone_id=self._timezone,
         )
+
+        await self._context.add_init_script(STEALTH_JS)
 
     async def open(self, url: str) -> str:
         """
@@ -425,6 +757,18 @@ class AgentBrowser:
             return await locator.inner_html()
         except Exception as error:
             raise to_ai_friendly_error(error, selector_or_ref) from error
+
+    async def screenshot(self, page_id: str, path: str, full_page: bool = True) -> None:
+        """
+        Take a screenshot of the page.
+
+        Args:
+            page_id: Target page id returned by open().
+            path: File path to save the screenshot.
+            full_page: Whether to take a screenshot of the full scrollable page.
+        """
+        state = self._get_state(page_id)
+        await state.page.screenshot(path=path, full_page=full_page)
 
     async def find(
         self,
