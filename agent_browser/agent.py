@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Optional
 
@@ -34,7 +35,7 @@ class AgentBrowser:
         headless: bool = True,
         viewport: tuple[int, int] = (1280, 720),
         user_agent: Optional[str] = None,
-        timeout_ms: int = 30000,
+        timeout_ms: int = 60000,
         locale: Optional[str] = None,
         timezone: Optional[str] = None,
     ) -> None:
@@ -211,7 +212,7 @@ class AgentBrowser:
             selector_or_ref: CSS selector (e.g. "#submit") or ref (e.g. "@e3").
 
         Returns:
-            A dict describing what happened, including whether a new page was opened.
+            A dict describing what happened (url change, popup, download).
         """
         state = self._get_state(page_id)
         locator = self._get_locator(state, selector_or_ref)
@@ -220,25 +221,54 @@ class AgentBrowser:
     async def _click_locator(self, state: PageState, locator, selector: str) -> dict:
         url_before = state.page.url
         popup_timeout_ms = min(1500, self._timeout_ms)
+        download_timeout_ms = min(1500, self._timeout_ms)
         new_page: Optional[Page] = None
+        download = None
+        page_task = None
+        download_task = None
 
         try:
             if self._context:
-                try:
-                    async with self._context.expect_page(timeout=popup_timeout_ms) as page_info:
-                        await locator.click()
-                    new_page = await page_info.value
-                except PlaywrightTimeoutError:
-                    new_page = None
-            else:
-                await locator.click()
+                page_task = asyncio.create_task(
+                    self._context.wait_for_event("page", timeout=popup_timeout_ms)
+                )
+            download_task = asyncio.create_task(
+                state.page.wait_for_event("download", timeout=download_timeout_ms)
+            )
+            await locator.click()
+            try:
+                await state.page.wait_for_load_state("domcontentloaded", timeout=popup_timeout_ms)
+            except PlaywrightTimeoutError:
+                pass
         except Exception as error:
+            for task in (page_task, download_task):
+                if task and not task.done():
+                    task.cancel()
             raise to_ai_friendly_error(error, selector) from error
+
+        if page_task:
+            try:
+                new_page = await page_task
+            except PlaywrightTimeoutError:
+                new_page = None
+
+        if download_task:
+            try:
+                download = await download_task
+            except PlaywrightTimeoutError:
+                download = None
 
         new_pages: list[dict] = []
         if new_page:
             new_page_id = self._register_page(new_page)
             new_pages.append({"page_id": new_page_id, "url": new_page.url})
+
+        download_info = None
+        if download:
+            download_info = {
+                "url": download.url,
+                "suggested_filename": download.suggested_filename,
+            }
 
         return {
             "clicked": True,
@@ -247,9 +277,11 @@ class AgentBrowser:
             "opened_new_page": len(new_pages) > 0,
             "new_page_ids": [p["page_id"] for p in new_pages],
             "new_pages": new_pages,
+            "downloaded": download_info is not None,
+            "download": download_info,
         }
 
-    async def fill(self, page_id: str, selector_or_ref: str, text: str) -> None:
+    async def fill(self, page_id: str, selector_or_ref: str, text: str) -> dict:
         """
         Clear and fill an input element.
 
@@ -259,16 +291,18 @@ class AgentBrowser:
             text: Text to fill into the element.
 
         Returns:
-            None
+            A dict describing what happened, including the resulting value.
         """
         state = self._get_state(page_id)
         locator = self._get_locator(state, selector_or_ref)
         try:
             await locator.fill(text)
+            value = await locator.input_value()
         except Exception as error:
             raise to_ai_friendly_error(error, selector_or_ref) from error
+        return {"filled": True, "value": value, "url": state.page.url}
 
-    async def select(self, page_id: str, selector_or_ref: str, value: str) -> None:
+    async def select(self, page_id: str, selector_or_ref: str, value: str) -> dict:
         """
         Select an option in a <select> element.
 
@@ -278,16 +312,43 @@ class AgentBrowser:
             value: Option value to select.
 
         Returns:
-            None
+            A dict describing what happened, including the resulting value.
         """
         state = self._get_state(page_id)
         locator = self._get_locator(state, selector_or_ref)
         try:
             await locator.select_option(value=value)
+            selected = await locator.input_value()
         except Exception as error:
             raise to_ai_friendly_error(error, selector_or_ref) from error
+        return {"selected": True, "value": selected, "url": state.page.url}
 
-    async def check(self, page_id: str, selector_or_ref: str) -> None:
+    async def press(self, page_id: str, selector_or_ref: str, key: str) -> dict:
+        """
+        Press a key on an element.
+
+        Args:
+            page_id: Target page id returned by open().
+            selector_or_ref: CSS selector or ref (e.g. "@e3").
+            key: Playwright key name (e.g. "Enter").
+
+        Returns:
+            A dict describing what happened (e.g. url change).
+        """
+        state = self._get_state(page_id)
+        locator = self._get_locator(state, selector_or_ref)
+        url_before = state.page.url
+        try:
+            await locator.press(key)
+            try:
+                await state.page.wait_for_load_state("domcontentloaded", timeout=min(1500, self._timeout_ms))
+            except PlaywrightTimeoutError:
+                pass
+        except Exception as error:
+            raise to_ai_friendly_error(error, selector_or_ref) from error
+        return {"pressed": True, "url_before": url_before, "url_after": state.page.url}
+
+    async def check(self, page_id: str, selector_or_ref: str) -> dict:
         """
         Check a checkbox.
 
@@ -296,16 +357,18 @@ class AgentBrowser:
             selector_or_ref: CSS selector or ref (e.g. "@e3").
 
         Returns:
-            None
+            A dict describing what happened, including current checked state.
         """
         state = self._get_state(page_id)
         locator = self._get_locator(state, selector_or_ref)
         try:
             await locator.check()
+            checked = await locator.is_checked()
         except Exception as error:
             raise to_ai_friendly_error(error, selector_or_ref) from error
+        return {"checked": True, "is_checked": checked, "url": state.page.url}
 
-    async def uncheck(self, page_id: str, selector_or_ref: str) -> None:
+    async def uncheck(self, page_id: str, selector_or_ref: str) -> dict:
         """
         Uncheck a checkbox.
 
@@ -314,16 +377,18 @@ class AgentBrowser:
             selector_or_ref: CSS selector or ref (e.g. "@e3").
 
         Returns:
-            None
+            A dict describing what happened, including current checked state.
         """
         state = self._get_state(page_id)
         locator = self._get_locator(state, selector_or_ref)
         try:
             await locator.uncheck()
+            checked = await locator.is_checked()
         except Exception as error:
             raise to_ai_friendly_error(error, selector_or_ref) from error
+        return {"unchecked": True, "is_checked": checked, "url": state.page.url}
 
-    async def upload(self, page_id: str, selector_or_ref: str, files: Iterable[str]) -> None:
+    async def upload(self, page_id: str, selector_or_ref: str, files: Iterable[str]) -> dict:
         """
         Upload files via an <input type="file"> element.
 
@@ -333,7 +398,7 @@ class AgentBrowser:
             files: File paths to upload.
 
         Returns:
-            None
+            A dict describing what happened.
         """
         state = self._get_state(page_id)
         locator = self._get_locator(state, selector_or_ref)
@@ -341,6 +406,7 @@ class AgentBrowser:
             await locator.set_input_files(list(files))
         except Exception as error:
             raise to_ai_friendly_error(error, selector_or_ref) from error
+        return {"uploaded": True, "url": state.page.url}
 
     async def inner_html(self, page_id: str, selector_or_ref: str) -> str:
         """
@@ -381,7 +447,7 @@ class AgentBrowser:
                 "role", "text", "label", "placeholder", "alt", "title", "testid",
                 "first", "last", "nth", "css".
             action: One of:
-                "click", "fill", "select", "check", "uncheck", "upload",
+                "click", "fill", "select", "press", "check", "uncheck", "upload",
                 "inner_html", "text", "value", "hover", "count",
                 "is_visible", "is_enabled", "is_checked".
             value: Strategy input value (e.g. role name / text / label / test id).
@@ -392,8 +458,7 @@ class AgentBrowser:
             files: Files to upload (required for action="upload").
 
         Returns:
-            A dict-like result for query actions (e.g. {"text": "..."}), or an ack dict for
-            operation actions (e.g. click returns a dict including opened_new_page/new_page_ids).
+            A dict describing the action result.
         """
         state = self._get_state(page_id)
         page = state.page
@@ -448,7 +513,12 @@ class AgentBrowser:
 
         selector_label = f"{strategy}:{value or selector or name or ''}".strip(":")
         return await self._perform_action(
-            state, locator, action, value=action_value, files=files, selector=selector_label
+            state,
+            locator,
+            action,
+            value=action_value,
+            files=files,
+            selector=selector_label,
         )
 
     async def _perform_action(
@@ -467,23 +537,33 @@ class AgentBrowser:
                 if value is None:
                     raise ValueError("action=fill 需要 action_value 参数")
                 await locator.fill(value)
-                return {"filled": True}
+                return {"filled": True, "value": await locator.input_value(), "url": state.page.url}
             if action == "select":
                 if value is None:
                     raise ValueError("action=select 需要 action_value 参数")
                 await locator.select_option(value=value)
-                return {"selected": True}
+                return {"selected": True, "value": await locator.input_value(), "url": state.page.url}
+            if action == "press":
+                if value is None:
+                    raise ValueError("action=press 需要 action_value 参数")
+                url_before = state.page.url
+                await locator.press(value)
+                try:
+                    await state.page.wait_for_load_state("domcontentloaded", timeout=min(1500, self._timeout_ms))
+                except PlaywrightTimeoutError:
+                    pass
+                return {"pressed": True, "url_before": url_before, "url_after": state.page.url}
             if action == "check":
                 await locator.check()
-                return {"checked": True}
+                return {"checked": True, "is_checked": await locator.is_checked(), "url": state.page.url}
             if action == "uncheck":
                 await locator.uncheck()
-                return {"unchecked": True}
+                return {"unchecked": True, "is_checked": await locator.is_checked(), "url": state.page.url}
             if action == "upload":
                 if files is None:
                     raise ValueError("action=upload 需要 files 参数")
                 await locator.set_input_files(list(files))
-                return {"uploaded": True}
+                return {"uploaded": True, "url": state.page.url}
             if action == "inner_html":
                 return {"inner_html": await locator.inner_html()}
             if action == "text":
