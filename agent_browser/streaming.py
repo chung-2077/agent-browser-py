@@ -15,6 +15,7 @@ class StreamServer:
     def __init__(
         self,
         page: Page,
+        page_id: str,
         on_frame: Callable[[Dict[str, Any]], Awaitable[None] | None],
         on_status: Optional[Callable[[Dict[str, Any]], Awaitable[None] | None]] = None,
         image_format: str = "jpeg",
@@ -25,6 +26,7 @@ class StreamServer:
         fallback_interval: float = 0.2,
     ) -> None:
         self._page = page
+        self._page_id = page_id
         self._on_frame = on_frame
         self._on_status = on_status
         self._image_format = image_format
@@ -37,6 +39,7 @@ class StreamServer:
         self._screencast_task: Optional[asyncio.Task] = None
         self._running = False
         self._use_cdp = True
+        self._last_url: Optional[str] = None
 
     async def start(self) -> None:
         self._running = True
@@ -51,8 +54,11 @@ class StreamServer:
         if not self._on_status:
             return
         viewport = self._page.viewport_size or {}
+        self._last_url = self._page.url
         payload = {
             "type": "status",
+            "page_id": self._page_id,
+            "url": self._last_url,
             "connected": True,
             "screencasting": self._screencast_task is not None,
             "viewportWidth": viewport.get("width"),
@@ -100,9 +106,12 @@ class StreamServer:
             params["everyNthFrame"] = self._every_nth_frame
 
         async def handle_frame(frame: Dict[str, Any]) -> None:
+            self._last_url = self._page.url
             await self._emit_frame(
                 {
                     "type": "frame",
+                    "page_id": self._page_id,
+                    "url": self._last_url,
                     "data": frame.get("data"),
                     "metadata": frame.get("metadata", {}),
                 }
@@ -123,9 +132,12 @@ class StreamServer:
                 full_page=False,
             )
             data = base64.b64encode(image_bytes).decode("utf-8")
+            self._last_url = self._page.url
             await self._emit_frame(
                 {
                     "type": "frame",
+                    "page_id": self._page_id,
+                    "url": self._last_url,
                     "data": data,
                     "metadata": {
                         "timestamp": asyncio.get_running_loop().time(),

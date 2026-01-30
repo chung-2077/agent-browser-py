@@ -129,6 +129,13 @@ await browser.stream_inject_touch(
 await browser.stream_stop(page_id)
 ```
 
+Payload types:
+- `type="frame"`: `page_id`, `url`, `data` (base64 image), `metadata` (CDP metadata or fallback timestamp)
+- `type="status"`: `page_id`, `url`, `connected`, `screencasting`, `viewportWidth`, `viewportHeight`
+
+Notes:
+- `page_id="*"` streams all pages (including pages opened later) and each payload includes its `page_id`.
+
 ## 中文介绍
 
 Agent Browser 是一个面向 AI Agent 的 Playwright 轻量封装：

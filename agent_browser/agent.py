@@ -363,6 +363,8 @@ class AgentBrowser:
         self._context: Optional[BrowserContext] = None
         self._pages: Dict[str, PageState] = {}
         self._page_counter = 0
+        self._stream_all_config: Optional[Dict[str, Any]] = None
+        self._stream_all_page_ids: set[str] = set()
 
     async def start(self) -> None:
         """
@@ -434,15 +436,19 @@ class AgentBrowser:
         page = await self._context.new_page()
         page.set_default_timeout(self._timeout_ms)
         await page.goto(url, wait_until="domcontentloaded")
-        return self._register_page(page)
+        page_id = await self._register_page(page)
+        return page_id
 
-    def _register_page(self, page: Page) -> str:
+    async def _register_page(self, page: Page) -> str:
         self._page_counter += 1
         page_id = f"p{self._page_counter}"
         page.set_default_timeout(self._timeout_ms)
         state = PageState(page=page)
         state.console.attach(page)
         self._pages[page_id] = state
+        if self._stream_all_config:
+            await self._start_stream_for_page(page_id, self._stream_all_config)
+            self._stream_all_page_ids.add(page_id)
         return page_id
 
     async def close(self, page_id: Optional[str] = None) -> None:
@@ -464,6 +470,7 @@ class AgentBrowser:
                 if state.console_server:
                     await state.console_server.stop()
                 await state.page.close()
+            self._stream_all_page_ids.discard(page_id)
             return
 
         for pid in list(self._pages.keys()):
@@ -483,6 +490,28 @@ class AgentBrowser:
         if page_id not in self._pages:
             raise KeyError(f"未知的 page_id: {page_id}")
         return self._pages[page_id]
+
+    async def _start_stream_for_page(
+        self,
+        page_id: str,
+        config: Dict[str, Any],
+    ) -> StreamServer:
+        state = self._get_state(page_id)
+        if state.stream_server:
+            return state.stream_server
+        state.stream_server = StreamServer(
+            state.page,
+            page_id=page_id,
+            on_frame=config["on_frame"],
+            on_status=config.get("on_status"),
+            image_format=config["image_format"],
+            quality=config["quality"],
+            max_width=config.get("max_width"),
+            max_height=config.get("max_height"),
+            every_nth_frame=config.get("every_nth_frame"),
+        )
+        await state.stream_server.start()
+        return state.stream_server
 
     async def snapshot(
         self,
@@ -592,7 +621,7 @@ class AgentBrowser:
 
         new_pages: list[dict] = []
         if new_page:
-            new_page_id = self._register_page(new_page)
+            new_page_id = await self._register_page(new_page)
             new_pages.append({"page_id": new_page_id, "url": new_page.url})
 
         download_info = None
@@ -1117,12 +1146,12 @@ class AgentBrowser:
         max_width: Optional[int] = None,
         max_height: Optional[int] = None,
         every_nth_frame: Optional[int] = None,
-    ) -> StreamServer:
+    ) -> StreamServer | Dict[str, StreamServer]:
         """
         Start streaming the page viewport via callbacks.
 
         Args:
-            page_id: Target page id returned by open().
+            page_id: Target page id returned by open(), or "*" for all pages.
             on_frame: Callback invoked for each frame payload.
             on_status: Optional callback invoked for status payload updates.
             image_format: "jpeg" or "png" for emitted frame data.
@@ -1132,38 +1161,57 @@ class AgentBrowser:
             every_nth_frame: Optional frame sampling for CDP screencast.
 
         Returns:
-            The StreamServer instance bound to this page.
+            StreamServer for a single page, or a mapping for all pages when page_id="*".
         """
-        state = self._get_state(page_id)
-        if state.stream_server:
-            return state.stream_server
-        state.stream_server = StreamServer(
-            state.page,
-            on_frame=on_frame,
-            on_status=on_status,
-            image_format=image_format,
-            quality=quality,
-            max_width=max_width,
-            max_height=max_height,
-            every_nth_frame=every_nth_frame,
-        )
-        await state.stream_server.start()
-        return state.stream_server
+        config = {
+            "on_frame": on_frame,
+            "on_status": on_status,
+            "image_format": image_format,
+            "quality": quality,
+            "max_width": max_width,
+            "max_height": max_height,
+            "every_nth_frame": every_nth_frame,
+        }
+
+        if page_id == "*":
+            self._stream_all_config = config
+            servers: Dict[str, StreamServer] = {}
+            for pid, state in self._pages.items():
+                was_running = state.stream_server is not None
+                server = await self._start_stream_for_page(pid, config)
+                servers[pid] = server
+                if not was_running:
+                    self._stream_all_page_ids.add(pid)
+            return servers
+
+        return await self._start_stream_for_page(page_id, config)
 
     async def stream_stop(self, page_id: str) -> None:
         """
         Stop streaming for the given page.
 
         Args:
-            page_id: Target page id returned by open().
+            page_id: Target page id returned by open(), or "*" for all pages.
 
         Returns:
             None
         """
+        if page_id == "*":
+            page_ids = list(self._stream_all_page_ids)
+            for pid in page_ids:
+                state = self._get_state(pid)
+                if state.stream_server:
+                    await state.stream_server.stop()
+                    state.stream_server = None
+            self._stream_all_page_ids.clear()
+            self._stream_all_config = None
+            return
+
         state = self._get_state(page_id)
         if state.stream_server:
             await state.stream_server.stop()
             state.stream_server = None
+        self._stream_all_page_ids.discard(page_id)
 
     async def stream_inject_mouse(
         self,
