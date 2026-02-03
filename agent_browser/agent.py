@@ -386,12 +386,11 @@ class AgentBrowser:
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
-            "--ignore-gpu-blocklist",
-            "--use-gl=angle",
-            "--use-angle=gl",
             "--no-first-run",
             "--no-zygote",
         ]
+        if self._headless:
+            args.extend(["--ignore-gpu-blocklist"])
 
         self._browser = await self._playwright.chromium.launch(
             headless=self._headless,
@@ -437,7 +436,7 @@ class AgentBrowser:
         page.set_default_timeout(self._timeout_ms)
         await page.goto(url, wait_until="domcontentloaded")
         page_id = await self._register_page(page)
-        return page_id
+        return f"page_id: {page_id}"
 
     async def _register_page(self, page: Page) -> str:
         self._page_counter += 1
@@ -520,7 +519,7 @@ class AgentBrowser:
         max_depth: Optional[int] = None,
         compact: bool = False,
         selector: Optional[str] = None,
-    ) -> EnhancedSnapshot:
+    ) -> str:
         """
         Get an accessibility snapshot of the page and generate stable refs.
 
@@ -545,7 +544,7 @@ class AgentBrowser:
         )
         snapshot = await get_enhanced_snapshot(state.page, options)
         state.refs = snapshot.refs
-        return snapshot
+        return snapshot.tree
 
     def _resolve_ref_locator(self, state: PageState, ref_id: str):
         if ref_id not in state.refs:

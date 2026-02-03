@@ -37,17 +37,24 @@ class StreamServer:
         self._fallback_interval = fallback_interval
         self._cdp_session = None
         self._screencast_task: Optional[asyncio.Task] = None
+        self._frame_watch_task: Optional[asyncio.Task] = None
         self._running = False
         self._use_cdp = True
         self._last_url: Optional[str] = None
+        self._frame_count = 0
+        self._fallback_startup_timeout = 1.0
 
     async def start(self) -> None:
         self._running = True
+        self._frame_count = 0
         await self._emit_status()
         await self._start_screencast()
 
     async def stop(self) -> None:
         self._running = False
+        if self._frame_watch_task:
+            self._frame_watch_task.cancel()
+            self._frame_watch_task = None
         await self._stop_screencast()
 
     async def _emit_status(self) -> None:
@@ -107,6 +114,10 @@ class StreamServer:
 
         async def handle_frame(frame: Dict[str, Any]) -> None:
             self._last_url = self._page.url
+            self._frame_count += 1
+            if self._frame_watch_task:
+                self._frame_watch_task.cancel()
+                self._frame_watch_task = None
             await self._emit_frame(
                 {
                     "type": "frame",
@@ -123,6 +134,18 @@ class StreamServer:
         self._cdp_session.on("Page.screencastFrame", lambda frame: asyncio.create_task(handle_frame(frame)))
         await self._cdp_session.send("Page.startScreencast", params)
         self._screencast_task = asyncio.create_task(self._keepalive())
+        if not self._frame_watch_task:
+            self._frame_watch_task = asyncio.create_task(self._ensure_frames())
+
+    async def _ensure_frames(self) -> None:
+        await asyncio.sleep(self._fallback_startup_timeout)
+        if not self._running or not self._cdp_session:
+            return
+        if self._frame_count == 0:
+            await self._stop_screencast()
+            self._use_cdp = False
+            if self._running:
+                self._screencast_task = asyncio.create_task(self._start_fallback_stream())
 
     async def _start_fallback_stream(self) -> None:
         while self._running:
@@ -154,6 +177,9 @@ class StreamServer:
         if self._screencast_task:
             self._screencast_task.cancel()
             self._screencast_task = None
+        if self._frame_watch_task:
+            self._frame_watch_task.cancel()
+            self._frame_watch_task = None
         if self._cdp_session:
             try:
                 await self._cdp_session.send("Page.stopScreencast")

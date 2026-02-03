@@ -1,6 +1,9 @@
 import sys
 import asyncio
 import shlex
+import base64
+import time
+from pathlib import Path
 
 from agent_browser import AgentBrowser
 
@@ -40,6 +43,8 @@ async def cli() -> None:
     browser = AgentBrowser(headless=headless)
     current_page: str | None = None
     known_pages: set[str] = set()
+    stream_running = False
+    frame_counters: dict[str, int] = {}
 
     print("Agent Browser CLI 已启动，输入 help 查看命令。")
 
@@ -81,6 +86,8 @@ async def cli() -> None:
                             "upload <selector_or_ref> <file1> [file2...]",
                             "inner_html <selector_or_ref>",
                             "find <strategy> <action> [--value v] [--name n] [--selector s] [--nth n] [--action-value v] [--file f]",
+                            "stream_start [--dir output] [--format jpeg|png] [--quality q] [--every_nth n]",
+                            "stream_stop",
                             "close [page_id]",
                             "test_stealth",
                             "exit|quit",
@@ -168,8 +175,8 @@ async def cli() -> None:
                     print(await browser.get_title(page_id))
                 elif command == "snapshot":
                     page_id = await require_page()
-                    snapshot = await browser.snapshot(page_id, interactive=False)
-                    print(snapshot.tree)
+                    snapshot_tree = await browser.snapshot(page_id, interactive=False)
+                    print(snapshot_tree)
                 elif command == "click":
                     page_id = await require_page()
                     result = await browser.click(page_id, args[0])
@@ -219,6 +226,47 @@ async def cli() -> None:
                     )
                     if result is not None:
                         print(result)
+                elif command == "stream_start":
+                    options = _parse_options(args)
+                    output_dir = Path(options.get("dir", "frames"))
+                    image_format = options.get("format", "jpeg")
+                    if image_format not in {"jpeg", "png"}:
+                        raise ValueError("image_format 必须是 jpeg 或 png")
+                    quality = int(options["quality"]) if "quality" in options else 80
+                    every_nth_frame = int(options["every_nth"]) if "every_nth" in options else None
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    frame_counters.clear()
+
+                    async def on_frame(payload: dict) -> None:
+                        if payload.get("type") != "frame":
+                            return
+                        data = payload.get("data")
+                        if not data:
+                            return
+                        page_id = payload.get("page_id", "unknown")
+                        counter = frame_counters.get(page_id, 0) + 1
+                        frame_counters[page_id] = counter
+                        ext = "jpg" if image_format == "jpeg" else "png"
+                        filename = f"{page_id}_{int(time.time() * 1000)}_{counter}.{ext}"
+                        image_bytes = base64.b64decode(data)
+                        await asyncio.to_thread((output_dir / filename).write_bytes, image_bytes)
+
+                    await browser.stream_start(
+                        "*",
+                        on_frame=on_frame,
+                        image_format=image_format,
+                        quality=quality,
+                        every_nth_frame=every_nth_frame,
+                    )
+                    stream_running = True
+                    print(f"帧监听已启动，输出目录: {output_dir}")
+                elif command == "stream_stop":
+                    if stream_running:
+                        await browser.stream_stop("*")
+                        stream_running = False
+                        print("帧监听已停止")
+                    else:
+                        print("帧监听未启动")
                 elif command == "close":
                     if args:
                         await browser.close(args[0])
