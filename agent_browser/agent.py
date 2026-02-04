@@ -489,6 +489,132 @@ COOKIE_BANNER_JS = """
 })();
 """
 
+POPUP_GUARD_JS = """
+(() => {
+    if (window.__popup_guard_installed) return;
+    window.__popup_guard_installed = true;
+    const selectors = [
+        "[role='dialog'] button[aria-label*='close']",
+        "[role='dialog'] button[aria-label*='dismiss']",
+        "[aria-label*='close']",
+        "[aria-label*='dismiss']",
+        "[aria-label*='skip']",
+        "[aria-label*='not now']",
+        "[data-testid*='close']",
+        "[data-testid*='dismiss']",
+        "[data-testid*='skip']",
+        ".modal-close",
+        ".popup-close",
+        ".overlay-close",
+        ".close-button",
+        ".btn-close",
+        ".ant-modal-close",
+        ".MuiDialog-root [aria-label*='close']",
+        ".MuiDialog-root [data-testid*='close']"
+    ];
+    const textMatchers = [
+        /^\\s*[x×]\\s*$/i,
+        /close/i,
+        /dismiss/i,
+        /skip/i,
+        /not\\s*,?\\s*now/i,
+        /later/i,
+        /no\\s*,?\\s*thanks/i,
+        /got it/i,
+        /取消/,
+        /关闭/,
+        /暂不/,
+        /以后/,
+        /稍后/,
+        /跳过/,
+        /不用了/,
+        /不\\s*谢谢/,
+        /不\\s*，?\\s*谢谢/,
+        /لا\\s*شكرا/i,
+        /ليس\\s*الآن/i,
+        /لاحقاً/i,
+        /لاحقًا/i,
+        /إغلاق/i,
+        /اغلاق/i,
+        /تخطي/i
+    ];
+    const isVisible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        if (!style) return false;
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+            return false;
+        }
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    };
+    const clickIfMatch = (el) => {
+        if (!el || !(el instanceof Element)) return false;
+        if (el.disabled) return false;
+        if (!isVisible(el)) return false;
+        const text = (el.innerText || el.textContent || "").trim();
+        if (text && textMatchers.some((matcher) => matcher.test(text))) {
+            el.click();
+            return true;
+        }
+        if (selectors.some((sel) => el.matches(sel))) {
+            el.click();
+            return true;
+        }
+        return false;
+    };
+    const findAndClick = () => {
+        let clicked = false;
+        for (const sel of selectors) {
+            const nodes = document.querySelectorAll(sel);
+            for (const node of nodes) {
+                if (clickIfMatch(node)) {
+                    clicked = true;
+                    break;
+                }
+            }
+            if (clicked) return true;
+        }
+        const candidates = document.querySelectorAll(
+            "button, [role='button'], input[type='button'], input[type='submit'], a, [aria-label]"
+        );
+        for (const node of candidates) {
+            if (clickIfMatch(node)) {
+                clicked = true;
+                break;
+            }
+        }
+        return clicked;
+    };
+    const run = () => {
+        let attempts = 0;
+        const maxAttempts = 20;
+        const intervalMs = 400;
+        const timer = window.setInterval(() => {
+            attempts += 1;
+            const clicked = findAndClick();
+            if (clicked || attempts >= maxAttempts) {
+                window.clearInterval(timer);
+            }
+        }, intervalMs);
+    };
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", run, { once: true });
+    } else {
+        run();
+    }
+    const observer = new MutationObserver(() => {
+        findAndClick();
+    });
+    observer.observe(document.documentElement || document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true
+    });
+    window.setTimeout(() => observer.disconnect(), 12000);
+})();
+"""
+
 
 @dataclass
 class PageState:
@@ -512,7 +638,7 @@ class AgentBrowser:
         headless: bool = True,
         viewport: tuple[int, int] = (1280, 720),
         user_agent: Optional[str] = None,
-        timeout_ms: int = 60000,
+        timeout_ms: int = 30000,
         locale: Optional[str] = None,
         timezone: Optional[str] = None,
         use_system_chrome: bool = False,
@@ -625,6 +751,8 @@ class AgentBrowser:
             await self._evaluate_script(page, self._stealth_js)
         await self._evaluate_script(page, COOKIE_BANNER_JS)
         await self._handle_cookie_banner(page)
+        await self._evaluate_script(page, POPUP_GUARD_JS)
+        await self._handle_popups(page)
         page_id = await self._register_page(page)
         return page_id
 
@@ -774,7 +902,7 @@ class AgentBrowser:
         close_texts = [
             re.compile(r"close", re.I),
             re.compile(r"dismiss", re.I),
-            re.compile(r"not now", re.I),
+            re.compile(r"not\\s*,?\\s*now", re.I),
             re.compile(r"skip", re.I),
             re.compile(r"later", re.I),
             re.compile(r"关闭", re.I),
@@ -792,6 +920,58 @@ class AgentBrowser:
             ):
                 break
             await asyncio.sleep(0.3)
+
+    async def _handle_popups(self, page: Page) -> None:
+        selectors = [
+            "[role='dialog'] button[aria-label*='close']",
+            "[role='dialog'] button[aria-label*='dismiss']",
+            "button[aria-label*='close']",
+            "button[aria-label*='dismiss']",
+            "button[aria-label*='skip']",
+            "button[aria-label*='not now']",
+            "[data-testid*='close']",
+            "[data-testid*='dismiss']",
+            "[data-testid*='skip']",
+            ".modal-close",
+            ".popup-close",
+            ".overlay-close",
+            ".close-button",
+            ".btn-close",
+            ".ant-modal-close",
+            ".MuiDialog-root [aria-label*='close']",
+            ".MuiDialog-root [data-testid*='close']",
+        ]
+        close_texts = [
+            re.compile(r"^\s*[x×]\s*$", re.I),
+            re.compile(r"close", re.I),
+            re.compile(r"dismiss", re.I),
+            re.compile(r"skip", re.I),
+            re.compile(r"not now", re.I),
+            re.compile(r"later", re.I),
+            re.compile(r"no\\s*,?\\s*thanks", re.I),
+            re.compile(r"got it", re.I),
+            re.compile(r"cancel", re.I),
+            re.compile(r"关闭"),
+            re.compile(r"暂不"),
+            re.compile(r"以后"),
+            re.compile(r"稍后"),
+            re.compile(r"跳过"),
+            re.compile(r"不用了"),
+            re.compile(r"不\\s*谢谢"),
+            re.compile(r"不\\s*，?\\s*谢谢"),
+            re.compile(r"لا\\s*شكرا", re.I),
+            re.compile(r"ليس\\s*الآن", re.I),
+            re.compile(r"لاحقاً", re.I),
+            re.compile(r"لاحقًا", re.I),
+            re.compile(r"إغلاق", re.I),
+            re.compile(r"اغلاق", re.I),
+            re.compile(r"تخطي", re.I),
+            re.compile(r"取消"),
+        ]
+        for _ in range(4):
+            if await self._try_click_popup(page, selectors, close_texts=close_texts):
+                break
+            await asyncio.sleep(0.25)
 
     async def _try_click_cookie(
         self,
@@ -860,17 +1040,84 @@ class AgentBrowser:
                 return True
         return False
 
+    async def _try_click_popup(
+        self,
+        page: Page,
+        selectors: list[str],
+        close_texts: list[re.Pattern],
+    ) -> bool:
+        frames = [page.main_frame] + [frame for frame in page.frames if frame != page.main_frame]
+        for frame in frames:
+            try:
+                dialog = frame.get_by_role("dialog")
+                if await dialog.count() > 0:
+                    for pat in close_texts:
+                        btn = dialog.get_by_role("button", name=pat)
+                        if await btn.count() > 0 and await btn.first.is_visible():
+                            await btn.first.click(timeout=800)
+                            return True
+            except Exception:
+                pass
+            for selector in selectors:
+                locator = frame.locator(selector)
+                try:
+                    if await locator.count() > 0 and await locator.first.is_visible():
+                        await locator.first.click(timeout=800)
+                        return True
+                except Exception:
+                    continue
+            async def try_patterns(patterns: list[re.Pattern]) -> bool:
+                for pattern in patterns:
+                    try:
+                        role_locator = frame.get_by_role("button", name=pattern)
+                        if await role_locator.count() > 0:
+                            await role_locator.first.click(timeout=800)
+                            return True
+                    except Exception:
+                        continue
+                return False
+            async def try_text(patterns: list[re.Pattern]) -> bool:
+                for pattern in patterns:
+                    try:
+                        text_locator = frame.locator(
+                            "button, [role='button'], input[type='button'], input[type='submit'], a",
+                            has_text=pattern,
+                        )
+                        if await text_locator.count() > 0:
+                            await text_locator.first.click(timeout=800)
+                            return True
+                    except Exception:
+                        continue
+                return False
+            if await try_patterns(close_texts) or await try_text(close_texts):
+                return True
+        return False
+
+    async def _dismiss_popups(self, page: Page) -> None:
+        await self._handle_popups(page)
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await self._handle_popups(page)
+
     async def _register_page(self, page: Page) -> str:
         self._page_counter += 1
         page_id = f"p{self._page_counter}"
         page.set_default_timeout(self._timeout_ms)
         state = PageState(page=page)
         state.console.attach(page)
+        self._attach_dialog_handler(page)
         self._pages[page_id] = state
         if self._stream_all_config:
             await self._start_stream_for_page(page_id, self._stream_all_config)
             self._stream_all_page_ids.add(page_id)
         return page_id
+
+    def _attach_dialog_handler(self, page: Page) -> None:
+        def handler(dialog) -> None:
+            asyncio.create_task(dialog.dismiss())
+        page.on("dialog", handler)
 
     async def close(self, page_id: Optional[str] = None) -> None:
         """
@@ -1004,64 +1251,74 @@ class AgentBrowser:
         url_before = state.page.url
         popup_timeout_ms = min(1500, self._timeout_ms)
         download_timeout_ms = min(1500, self._timeout_ms)
-        new_page: Optional[Page] = None
-        download = None
-        page_task = None
-        download_task = None
-
-        try:
-            if self._context:
-                page_task = asyncio.create_task(
-                    self._context.wait_for_event("page", timeout=popup_timeout_ms)
+        async def click_once() -> dict:
+            new_page: Optional[Page] = None
+            download = None
+            page_task = None
+            download_task = None
+            try:
+                if self._context:
+                    page_task = asyncio.create_task(
+                        self._context.wait_for_event("page", timeout=popup_timeout_ms)
+                    )
+                download_task = asyncio.create_task(
+                    state.page.wait_for_event("download", timeout=download_timeout_ms)
                 )
-            download_task = asyncio.create_task(
-                state.page.wait_for_event("download", timeout=download_timeout_ms)
-            )
-            await locator.click()
-            try:
-                await state.page.wait_for_load_state("domcontentloaded", timeout=popup_timeout_ms)
-            except PlaywrightTimeoutError:
-                pass
-        except Exception as error:
-            for task in (page_task, download_task):
-                if task and not task.done():
-                    task.cancel()
-            raise to_ai_friendly_error(error, selector) from error
+                await locator.click()
+                try:
+                    await state.page.wait_for_load_state("domcontentloaded", timeout=popup_timeout_ms)
+                except PlaywrightTimeoutError:
+                    pass
+            except Exception as error:
+                for task in (page_task, download_task):
+                    if task and not task.done():
+                        task.cancel()
+                raise error
 
-        if page_task:
-            try:
-                new_page = await page_task
-            except PlaywrightTimeoutError:
-                new_page = None
+            if page_task:
+                try:
+                    new_page = await page_task
+                except PlaywrightTimeoutError:
+                    new_page = None
 
-        if download_task:
-            try:
-                download = await download_task
-            except PlaywrightTimeoutError:
-                download = None
+            if download_task:
+                try:
+                    download = await download_task
+                except PlaywrightTimeoutError:
+                    download = None
 
-        new_pages: list[dict] = []
-        if new_page:
-            new_page_id = await self._register_page(new_page)
-            new_pages.append({"page_id": new_page_id, "url": new_page.url})
+            new_pages: list[dict] = []
+            if new_page:
+                new_page_id = await self._register_page(new_page)
+                new_pages.append({"page_id": new_page_id, "url": new_page.url})
 
-        download_info = None
-        if download:
-            download_info = {
-                "url": download.url,
-                "suggested_filename": download.suggested_filename,
+            download_info = None
+            if download:
+                download_info = {
+                    "url": download.url,
+                    "suggested_filename": download.suggested_filename,
+                }
+
+            return {
+                "clicked": True,
+                "url_before": url_before,
+                "url_after": state.page.url,
+                "opened_new_page": len(new_pages) > 0,
+                "new_page_ids": [p["page_id"] for p in new_pages],
+                "new_pages": new_pages,
+                "downloaded": download_info is not None,
+                "download": download_info,
             }
 
-        return {
-            "clicked": True,
-            "url_before": url_before,
-            "url_after": state.page.url,
-            "opened_new_page": len(new_pages) > 0,
-            "new_page_ids": [p["page_id"] for p in new_pages],
-            "new_pages": new_pages,
-            "downloaded": download_info is not None,
-            "download": download_info,
-        }
+        await self._dismiss_popups(state.page)
+        try:
+            return await click_once()
+        except Exception:
+            await self._dismiss_popups(state.page)
+            try:
+                return await click_once()
+            except Exception as retry_error:
+                raise to_ai_friendly_error(retry_error, selector) from retry_error
 
     async def fill(self, page_id: str, selector_or_ref: str, text: str) -> dict:
         """
