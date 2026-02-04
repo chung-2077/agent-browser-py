@@ -921,7 +921,7 @@ class AgentBrowser:
                 break
             await asyncio.sleep(0.3)
 
-    async def _handle_popups(self, page: Page) -> None:
+    async def _handle_popups(self, page: Page) -> bool:
         selectors = [
             "[role='dialog'] button[aria-label*='close']",
             "[role='dialog'] button[aria-label*='dismiss']",
@@ -970,16 +970,36 @@ class AgentBrowser:
         ]
         for _ in range(4):
             if await self._try_click_popup(page, selectors, close_texts=close_texts):
-                break
+                return True
             await asyncio.sleep(0.25)
+        return False
 
-    async def _disable_overlays(self, page: Page) -> None:
+    async def _disable_overlays(self, page: Page) -> int:
         script = """
         () => {
             const keywords = ["overlay", "backdrop", "modal", "mask", "popup", "pop-up", "lightbox"];
             const vw = window.innerWidth || document.documentElement.clientWidth || 0;
             const vh = window.innerHeight || document.documentElement.clientHeight || 0;
-            const nodes = Array.from(document.body ? document.body.querySelectorAll("*") : []);
+            const selectorHints = [
+                "[role='dialog']",
+                "[aria-modal='true']",
+                "[class*='overlay']",
+                "[class*='backdrop']",
+                "[class*='modal']",
+                "[class*='popup']",
+                "[id*='overlay']",
+                "[id*='backdrop']",
+                "[id*='modal']",
+                "[id*='popup']"
+            ];
+            const candidates = new Set();
+            for (const sel of selectorHints) {
+                const nodes = document.querySelectorAll(sel);
+                for (const node of nodes) {
+                    candidates.add(node);
+                }
+            }
+            const nodes = Array.from(candidates);
             let changed = 0;
             for (const el of nodes) {
                 const style = window.getComputedStyle(el);
@@ -1006,9 +1026,9 @@ class AgentBrowser:
         }
         """
         try:
-            await page.evaluate(script)
+            return await page.evaluate(script)
         except Exception:
-            pass
+            return 0
 
     async def _try_click_cookie(
         self,
@@ -1131,8 +1151,10 @@ class AgentBrowser:
         return False
 
     async def _dismiss_popups(self, page: Page) -> None:
-        await self._handle_popups(page)
-        await self._disable_overlays(page)
+        handled = await self._handle_popups(page)
+        changed = await self._disable_overlays(page)
+        if not handled and not changed:
+            return
         try:
             await page.keyboard.press("Escape")
         except Exception:
@@ -1354,7 +1376,6 @@ class AgentBrowser:
                 "download": download_info,
             }
 
-        await self._dismiss_popups(state.page)
         try:
             return await click_once()
         except Exception:
