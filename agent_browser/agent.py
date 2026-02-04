@@ -973,6 +973,43 @@ class AgentBrowser:
                 break
             await asyncio.sleep(0.25)
 
+    async def _disable_overlays(self, page: Page) -> None:
+        script = """
+        () => {
+            const keywords = ["overlay", "backdrop", "modal", "mask", "popup", "pop-up", "lightbox"];
+            const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+            const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+            const nodes = Array.from(document.body ? document.body.querySelectorAll("*") : []);
+            let changed = 0;
+            for (const el of nodes) {
+                const style = window.getComputedStyle(el);
+                if (!style) continue;
+                if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") continue;
+                if (style.pointerEvents === "none") continue;
+                if (!["fixed", "absolute", "sticky"].includes(style.position)) continue;
+                const role = el.getAttribute && el.getAttribute("role");
+                const ariaModal = el.getAttribute && el.getAttribute("aria-modal");
+                if (role === "dialog" || ariaModal === "true") continue;
+                if (el.querySelector && el.querySelector("button,[role='button'],input[type='button'],input[type='submit'],a")) {
+                    continue;
+                }
+                const cls = (el.className || "").toString().toLowerCase();
+                const id = (el.id || "").toLowerCase();
+                const label = `${cls} ${id}`;
+                if (!keywords.some((k) => label.includes(k))) continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < vw * 0.6 || rect.height < vh * 0.6) continue;
+                el.style.pointerEvents = "none";
+                changed += 1;
+            }
+            return changed;
+        }
+        """
+        try:
+            await page.evaluate(script)
+        except Exception:
+            pass
+
     async def _try_click_cookie(
         self,
         page: Page,
@@ -1095,11 +1132,13 @@ class AgentBrowser:
 
     async def _dismiss_popups(self, page: Page) -> None:
         await self._handle_popups(page)
+        await self._disable_overlays(page)
         try:
             await page.keyboard.press("Escape")
         except Exception:
             pass
         await self._handle_popups(page)
+        await self._disable_overlays(page)
 
     async def _register_page(self, page: Page) -> str:
         self._page_counter += 1
@@ -1256,23 +1295,28 @@ class AgentBrowser:
             download = None
             page_task = None
             download_task = None
+            tasks: list[asyncio.Task] = []
             try:
                 if self._context:
                     page_task = asyncio.create_task(
                         self._context.wait_for_event("page", timeout=popup_timeout_ms)
                     )
+                    tasks.append(page_task)
                 download_task = asyncio.create_task(
                     state.page.wait_for_event("download", timeout=download_timeout_ms)
                 )
+                tasks.append(download_task)
                 await locator.click()
                 try:
                     await state.page.wait_for_load_state("domcontentloaded", timeout=popup_timeout_ms)
                 except PlaywrightTimeoutError:
                     pass
             except Exception as error:
-                for task in (page_task, download_task):
-                    if task and not task.done():
+                for task in tasks:
+                    if not task.done():
                         task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
                 raise error
 
             if page_task:
