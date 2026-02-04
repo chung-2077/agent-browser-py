@@ -113,6 +113,9 @@ class StreamServer:
             params["everyNthFrame"] = self._every_nth_frame
 
         async def handle_frame(frame: Dict[str, Any]) -> None:
+            session = self._cdp_session
+            if not self._running or not session:
+                return
             self._last_url = self._page.url
             self._frame_count += 1
             if self._frame_watch_task:
@@ -127,9 +130,10 @@ class StreamServer:
                     "metadata": frame.get("metadata", {}),
                 }
             )
-            await self._cdp_session.send(
-                "Page.screencastFrameAck", {"sessionId": frame.get("sessionId")}
-            )
+            try:
+                await session.send("Page.screencastFrameAck", {"sessionId": frame.get("sessionId")})
+            except Exception:
+                pass
 
         self._cdp_session.on("Page.screencastFrame", lambda frame: asyncio.create_task(handle_frame(frame)))
         await self._cdp_session.send("Page.startScreencast", params)
