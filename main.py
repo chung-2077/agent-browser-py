@@ -42,7 +42,7 @@ async def cli() -> None:
     print(f"正在启动浏览器 (Headless: {headless}, Browser: {browser_label})...")
     # 注意：Playwright 默认使用的就是其绑定的 Chromium，而非系统 Chrome。
     # 除非显式指定 channel="chrome"，否则都是 Chromium。
-    browser = AgentBrowser(headless=headless, use_system_chrome=use_system_chrome)
+    browser = AgentBrowser(headless=headless, use_system_chrome=use_system_chrome,stealth_js=None)
     current_page: str | None = None
     known_pages: set[str] = set()
     stream_running = False
@@ -178,7 +178,7 @@ async def cli() -> None:
                     print(await browser.get_title(page_id))
                 elif command == "snapshot":
                     page_id = await require_page()
-                    snapshot_tree = await browser.snapshot(page_id, interactive=False)
+                    snapshot_tree = await browser.snapshot(page_id, interactive=False,compact=True)
                     print(snapshot_tree)
                 elif command == "click":
                     page_id = await require_page()

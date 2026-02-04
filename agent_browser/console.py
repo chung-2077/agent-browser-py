@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set
 
 import websockets
-from playwright.async_api import ConsoleMessage, Page
+from patchright.async_api import ConsoleMessage, Page
 
 
 @dataclass

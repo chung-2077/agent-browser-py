@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Optional
 
-from playwright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
+from patchright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 
 from .console import ConsoleRecorder, ConsoleStreamServer
 from .errors import to_ai_friendly_error
@@ -316,6 +317,20 @@ COOKIE_BANNER_JS = """
     const selectors = [
         "#onetrust-accept-btn-handler",
         "#onetrust-reject-all-handler",
+        "#onetrust-pc-btn-handler",
+        "#save-preference-btn-handler",
+        "#sp-cc-accept",
+        "#sp-cc-rejectall",
+        "#sp-cc-save",
+        "#didomi-notice-agree-button",
+        "#didomi-notice-disagree-button",
+        "#CybotCookiebotDialogBodyLevelButtonAccept",
+        "#CybotCookiebotDialogBodyLevelButtonReject",
+        "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+        "#truste-consent-button",
+        ".truste-consent-button",
+        "button[aria-label*='close']",
+        "button[aria-label*='dismiss']",
         "button[aria-label*='accept']",
         "button[aria-label*='agree']",
         "button[aria-label*='consent']",
@@ -324,6 +339,7 @@ COOKIE_BANNER_JS = """
         "[data-testid*='accept']",
         "[data-testid*='agree']",
         "[data-testid*='consent']",
+        "[data-testid*='reject']",
         ".cookie-accept",
         ".cookie-consent-accept",
         ".cc-allow",
@@ -333,18 +349,64 @@ COOKIE_BANNER_JS = """
         ".cookie-consent button"
     ];
     const textMatchers = [
+        /accept all/i,
         /accept/i,
         /agree/i,
         /allow all/i,
+        /allow cookies/i,
         /ok/i,
         /got it/i,
         /consent/i,
+        /submit all preferences/i,
+        /save preferences/i,
+        /confirm my choices/i,
         /同意/,
         /接受/,
         /允许/,
         /好的/,
         /知道了/,
-        /继续/
+        /继续/,
+        /全部接受/,
+        /全部同意/,
+        /全部允许/,
+        /只保留必要/,
+        /仅必要/,
+        /仅使用必要/,
+        /拒绝全部/,
+        /全部拒绝/,
+        /拒绝/,
+        /accepter tout/i,
+        /accepter/i,
+        /tout accepter/i,
+        /tout refuser/i,
+        /refuser/i,
+        /param[eè]tres/i,
+        /personnaliser/i,
+        /aceptar todo/i,
+        /aceptar/i,
+        /rechazar todo/i,
+        /rechazar/i,
+        /configurar/i,
+        /preferencias/i,
+        /accetta tutto/i,
+        /accetta/i,
+        /rifiuta tutto/i,
+        /rifiuta/i,
+        /impostazioni/i,
+        /aceitar tudo/i,
+        /aceitar/i,
+        /rejeitar tudo/i,
+        /rejeitar/i,
+        /alles akzeptieren/i,
+        /akzeptieren/i,
+        /alles ablehnen/i,
+        /ablehnen/i,
+        /einstellungen/i,
+        /alles accepteren/i,
+        /accepteren/i,
+        /alles weigeren/i,
+        /weigeren/i,
+        /instellingen/i
     ];
     const isVisible = (el) => {
         if (!el) return false;
@@ -368,7 +430,9 @@ COOKIE_BANNER_JS = """
         }
         return false;
     };
+    let handled = false;
     const findAndClick = () => {
+        if (handled) return true;
         let clicked = false;
         for (const sel of selectors) {
             const nodes = document.querySelectorAll(sel);
@@ -388,6 +452,9 @@ COOKIE_BANNER_JS = """
                 clicked = true;
                 break;
             }
+        }
+        if (clicked) {
+            handled = true;
         }
         return clicked;
     };
@@ -409,13 +476,16 @@ COOKIE_BANNER_JS = """
         run();
     }
     const observer = new MutationObserver(() => {
-        findAndClick();
+        if (findAndClick()) {
+            observer.disconnect();
+        }
     });
     observer.observe(document.documentElement || document.body, {
         childList: true,
         subtree: true,
         attributes: true
     });
+    window.setTimeout(() => observer.disconnect(), 8000);
 })();
 """
 
@@ -446,6 +516,8 @@ class AgentBrowser:
         locale: Optional[str] = None,
         timezone: Optional[str] = None,
         use_system_chrome: bool = False,
+        cookie_policy: str = "accept_all",
+        stealth_js: Optional[str] = None,
     ) -> None:
         """
         Create an AgentBrowser instance.
@@ -469,6 +541,8 @@ class AgentBrowser:
         self._locale = locale
         self._timezone = timezone
         self._use_system_chrome = use_system_chrome
+        self._cookie_policy = cookie_policy
+        self._stealth_js = stealth_js
         self._playwright = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
@@ -505,9 +579,9 @@ class AgentBrowser:
 
         launch_kwargs = {
             "headless": self._headless,
-            "args": args,
-            "ignore_default_args": ["--enable-automation"],
         }
+        if args:
+            launch_kwargs["args"] = args
         if self._use_system_chrome:
             launch_kwargs["channel"] = "chrome"
         self._browser = await self._playwright.chromium.launch(**launch_kwargs)
@@ -531,8 +605,6 @@ class AgentBrowser:
             timezone_id=self._timezone,
         )
 
-        await self._context.add_init_script(STEALTH_JS)
-
     async def open(self, url: str) -> str:
         """
         Open a new page and navigate to the given URL.
@@ -549,9 +621,244 @@ class AgentBrowser:
         page = await self._context.new_page()
         page.set_default_timeout(self._timeout_ms)
         await page.goto(url, wait_until="domcontentloaded")
-        await page.evaluate(COOKIE_BANNER_JS)
+        if self._stealth_js:
+            await self._evaluate_script(page, self._stealth_js)
+        await self._evaluate_script(page, COOKIE_BANNER_JS)
+        await self._handle_cookie_banner(page)
         page_id = await self._register_page(page)
-        return f"page_id: {page_id}"
+        return page_id
+
+    async def _evaluate_script(self, page: Page, script: str) -> None:
+        await page.evaluate(f"(function(){{{script}}})()")
+
+    async def _handle_cookie_banner(self, page: Page) -> None:
+        selectors = [
+            "#onetrust-accept-btn-handler",
+            "#onetrust-reject-all-handler",
+            "#save-preference-btn-handler",
+            "#onetrust-pc-btn-handler",
+            "#sp-cc-accept",
+            "#sp-cc-rejectall",
+            "#sp-cc-save",
+            "#didomi-notice-agree-button",
+            "#didomi-notice-disagree-button",
+            "#CybotCookiebotDialogBodyLevelButtonAccept",
+            "#CybotCookiebotDialogBodyLevelButtonReject",
+            "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
+            "#truste-consent-button",
+            ".truste-consent-button",
+            ".qc-cmp2-summary-buttons button",
+            "#qc-cmp2-ui .qc-cmp2-close",
+            ".ot-close-icon",
+            ".onetrust-close-btn-handler",
+            "button[aria-label*='accept']",
+            "button[aria-label*='agree']",
+            "button[aria-label*='consent']",
+            "button[aria-label*='close']",
+            "button[aria-label*='dismiss']",
+            "button[aria-label*='同意']",
+            "button[aria-label*='接受']",
+            "[data-testid*='accept']",
+            "[data-testid*='agree']",
+            "[data-testid*='consent']",
+            "[data-testid*='reject']",
+            ".cookie-accept",
+            ".cookie-consent-accept",
+            ".cc-allow",
+            ".cc-accept",
+            ".cc-btn",
+            ".cookie-banner button",
+            ".cookie-consent button",
+            "button.save-preference-btn-handler",
+            "button.ot-pc-refuse-all",
+            "button.ot-pc-accept-all",
+        ]
+        accept_texts = [
+            re.compile(r"accept all", re.I),
+            re.compile(r"accept", re.I),
+            re.compile(r"agree", re.I),
+            re.compile(r"allow all", re.I),
+            re.compile(r"consent", re.I),
+            re.compile(r"ok", re.I),
+            re.compile(r"got it", re.I),
+            re.compile(r"submit all preferences", re.I),
+            re.compile(r"save preferences", re.I),
+            re.compile(r"confirm my choices", re.I),
+            re.compile(r"allow all cookies", re.I),
+            re.compile(r"continue", re.I),
+            re.compile(r"i agree", re.I),
+            re.compile(r"agree and continue", re.I),
+            re.compile(r"accept cookies", re.I),
+            re.compile(r"allow cookies", re.I),
+            re.compile(r"accept & close", re.I),
+            re.compile(r"同意"),
+            re.compile(r"接受"),
+            re.compile(r"允许"),
+            re.compile(r"好的"),
+            re.compile(r"知道了"),
+            re.compile(r"继续"),
+            re.compile(r"全部接受"),
+            re.compile(r"全部同意"),
+            re.compile(r"全部允许"),
+            re.compile(r"只保留必要"),
+            re.compile(r"仅必要"),
+            re.compile(r"仅使用必要"),
+            re.compile(r"tout accepter", re.I),
+            re.compile(r"accepter", re.I),
+            re.compile(r"tout refuser", re.I),
+            re.compile(r"refuser", re.I),
+            re.compile(r"aceptar todo", re.I),
+            re.compile(r"aceptar", re.I),
+            re.compile(r"rechazar todo", re.I),
+            re.compile(r"rechazar", re.I),
+            re.compile(r"accetta tutto", re.I),
+            re.compile(r"accetta", re.I),
+            re.compile(r"rifiuta tutto", re.I),
+            re.compile(r"rifiuta", re.I),
+            re.compile(r"aceitar tudo", re.I),
+            re.compile(r"aceitar", re.I),
+            re.compile(r"rejeitar tudo", re.I),
+            re.compile(r"rejeitar", re.I),
+            re.compile(r"alles akzeptieren", re.I),
+            re.compile(r"akzeptieren", re.I),
+            re.compile(r"alles ablehnen", re.I),
+            re.compile(r"ablehnen", re.I),
+            re.compile(r"alles accepteren", re.I),
+            re.compile(r"accepteren", re.I),
+            re.compile(r"alles weigeren", re.I),
+            re.compile(r"weigeren", re.I),
+        ]
+        reject_texts = [
+            re.compile(r"reject all", re.I),
+            re.compile(r"decline", re.I),
+            re.compile(r"disagree", re.I),
+            re.compile(r"reject optional", re.I),
+            re.compile(r"only necessary", re.I),
+            re.compile(r"necessary only", re.I),
+            re.compile(r"use necessary", re.I),
+            re.compile(r"拒绝全部"),
+            re.compile(r"全部拒绝"),
+            re.compile(r"拒绝"),
+            re.compile(r"仅必要"),
+            re.compile(r"仅使用必要"),
+            re.compile(r"只保留必要"),
+            re.compile(r"tout refuser", re.I),
+            re.compile(r"refuser", re.I),
+            re.compile(r"rechazar todo", re.I),
+            re.compile(r"rechazar", re.I),
+            re.compile(r"rifiuta tutto", re.I),
+            re.compile(r"rifiuta", re.I),
+            re.compile(r"rejeitar tudo", re.I),
+            re.compile(r"rejeitar", re.I),
+            re.compile(r"alles ablehnen", re.I),
+            re.compile(r"ablehnen", re.I),
+            re.compile(r"alles weigeren", re.I),
+            re.compile(r"weigeren", re.I),
+        ]
+        save_texts = [
+            re.compile(r"submit.*preferences", re.I),
+            re.compile(r"save.*preferences", re.I),
+            re.compile(r"confirm.*choices", re.I),
+            re.compile(r"save settings", re.I),
+            re.compile(r"save & close", re.I),
+            re.compile(r"submit", re.I),
+            re.compile(r"confirm", re.I),
+            re.compile(r"apply", re.I),
+            re.compile(r"done", re.I),
+            re.compile(r"finish", re.I),
+            re.compile(r"提交", re.I),
+            re.compile(r"保存", re.I),
+            re.compile(r"确定", re.I),
+            re.compile(r"应用", re.I),
+        ]
+        close_texts = [
+            re.compile(r"close", re.I),
+            re.compile(r"dismiss", re.I),
+            re.compile(r"not now", re.I),
+            re.compile(r"skip", re.I),
+            re.compile(r"later", re.I),
+            re.compile(r"关闭", re.I),
+            re.compile(r"暂不", re.I),
+            re.compile(r"以后", re.I),
+        ]
+        for _ in range(6):
+            if await self._try_click_cookie(
+                page,
+                selectors,
+                accept_texts=accept_texts,
+                reject_texts=reject_texts,
+                save_texts=save_texts,
+                close_texts=close_texts,
+            ):
+                break
+            await asyncio.sleep(0.3)
+
+    async def _try_click_cookie(
+        self,
+        page: Page,
+        selectors: list[str],
+        accept_texts: list[re.Pattern],
+        reject_texts: list[re.Pattern],
+        save_texts: list[re.Pattern],
+        close_texts: list[re.Pattern],
+    ) -> bool:
+        frames = [page.main_frame] + [frame for frame in page.frames if frame != page.main_frame]
+        for frame in frames:
+            try:
+                dialog = frame.get_by_role("dialog")
+                if await dialog.count() > 0:
+                    if self._cookie_policy == "reject_optional":
+                        order = reject_texts + save_texts
+                    else:
+                        order = accept_texts + save_texts
+                    for pat in order:
+                        btn = dialog.get_by_role("button", name=pat)
+                        if await btn.count() > 0 and await btn.first.is_visible():
+                            await btn.first.click(timeout=1000)
+                            return True
+            except Exception:
+                pass
+            for selector in selectors:
+                locator = frame.locator(selector)
+                try:
+                    if await locator.count() > 0 and await locator.first.is_visible():
+                        await locator.first.click(timeout=800)
+                        return True
+                except Exception:
+                    continue
+            async def try_patterns(patterns: list[re.Pattern]) -> bool:
+                for pattern in patterns:
+                    try:
+                        role_locator = frame.get_by_role("button", name=pattern)
+                        if await role_locator.count() > 0:
+                            await role_locator.first.click(timeout=800)
+                            return True
+                    except Exception:
+                        continue
+                return False
+            async def try_text(patterns: list[re.Pattern]) -> bool:
+                for pattern in patterns:
+                    try:
+                        text_locator = frame.locator(
+                            "button, [role='button'], input[type='button'], input[type='submit'], a",
+                            has_text=pattern,
+                        )
+                        if await text_locator.count() > 0:
+                            await text_locator.first.click(timeout=800)
+                            return True
+                    except Exception:
+                        continue
+                return False
+            if self._cookie_policy == "reject_optional":
+                if await try_patterns(reject_texts) or await try_text(reject_texts):
+                    return True
+            if await try_patterns(accept_texts) or await try_text(accept_texts):
+                return True
+            if await try_patterns(save_texts) or await try_text(save_texts):
+                return True
+            if await try_patterns(close_texts) or await try_text(close_texts):
+                return True
+        return False
 
     async def _register_page(self, page: Page) -> str:
         self._page_counter += 1

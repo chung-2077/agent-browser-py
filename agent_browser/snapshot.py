@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 import re
 
-from playwright.async_api import Page
+from patchright.async_api import Page
 
 
 @dataclass

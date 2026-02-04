@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from typing import Any, Awaitable, Callable, Dict, Optional
-from playwright.async_api import Page
+from patchright.async_api import Page
 
 
 

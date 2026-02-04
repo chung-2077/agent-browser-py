@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Optional
 
-from playwright.async_api import Page
+from patchright.async_api import Page
 
 
 async def cookies_get(page: Page) -> list[dict]:
