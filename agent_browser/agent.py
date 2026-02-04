@@ -445,6 +445,7 @@ class AgentBrowser:
         timeout_ms: int = 60000,
         locale: Optional[str] = None,
         timezone: Optional[str] = None,
+        use_system_chrome: bool = False,
     ) -> None:
         """
         Create an AgentBrowser instance.
@@ -456,6 +457,7 @@ class AgentBrowser:
             timeout_ms: Default timeout (ms) for Playwright operations.
             locale: Browser context locale.
             timezone: Browser context timezone id.
+            use_system_chrome: Whether to launch system Chrome instead of bundled Chromium.
 
         Returns:
             None
@@ -466,6 +468,7 @@ class AgentBrowser:
         self._timeout_ms = timeout_ms
         self._locale = locale
         self._timezone = timezone
+        self._use_system_chrome = use_system_chrome
         self._playwright = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
@@ -500,11 +503,14 @@ class AgentBrowser:
         if self._headless:
             args.extend(["--ignore-gpu-blocklist"])
 
-        self._browser = await self._playwright.chromium.launch(
-            headless=self._headless,
-            args=args,
-            ignore_default_args=["--enable-automation"],
-        )
+        launch_kwargs = {
+            "headless": self._headless,
+            "args": args,
+            "ignore_default_args": ["--enable-automation"],
+        }
+        if self._use_system_chrome:
+            launch_kwargs["channel"] = "chrome"
+        self._browser = await self._playwright.chromium.launch(**launch_kwargs)
         
         # 如果未指定 user_agent，则使用去除 Headless 标记的默认 UA
         if not self._user_agent:

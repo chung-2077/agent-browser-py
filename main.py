@@ -36,11 +36,13 @@ def _parse_options(tokens: list[str]) -> dict:
 async def cli() -> None:
     # 简单的参数解析
     headless = "--headless" in sys.argv
+    use_system_chrome = "--chrome" in sys.argv or "--system-chrome" in sys.argv
     
-    print(f"正在启动浏览器 (Headless: {headless})...")
+    browser_label = "System Chrome" if use_system_chrome else "Chromium"
+    print(f"正在启动浏览器 (Headless: {headless}, Browser: {browser_label})...")
     # 注意：Playwright 默认使用的就是其绑定的 Chromium，而非系统 Chrome。
     # 除非显式指定 channel="chrome"，否则都是 Chromium。
-    browser = AgentBrowser(headless=headless)
+    browser = AgentBrowser(headless=headless, use_system_chrome=use_system_chrome)
     current_page: str | None = None
     known_pages: set[str] = set()
     stream_running = False
@@ -72,6 +74,7 @@ async def cli() -> None:
                 print(
                     "\n".join(
                         [
+                            "启动参数: --headless, --chrome/--system-chrome",
                             "open <url>",
                             "use <page_id>",
                             "url",
