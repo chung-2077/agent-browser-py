@@ -41,7 +41,14 @@ class ConsoleRecorder:
             try:
                 args.append(await arg.json_value())
             except Exception:
-                args.append(arg.to_string())
+                try:
+                    to_string = getattr(arg, "to_string", None)
+                    if callable(to_string):
+                        args.append(to_string())
+                    else:
+                        args.append(str(arg))
+                except Exception:
+                    args.append(None)
         entry = ConsoleEntry(
             timestamp=time.time(),
             type=message.type,

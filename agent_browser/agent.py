@@ -311,6 +311,114 @@ safeStealth("canvas_noise", () => {
 console.log("Stealth script finished");
 """
 
+COOKIE_BANNER_JS = """
+(() => {
+    const selectors = [
+        "#onetrust-accept-btn-handler",
+        "#onetrust-reject-all-handler",
+        "button[aria-label*='accept']",
+        "button[aria-label*='agree']",
+        "button[aria-label*='consent']",
+        "button[aria-label*='同意']",
+        "button[aria-label*='接受']",
+        "[data-testid*='accept']",
+        "[data-testid*='agree']",
+        "[data-testid*='consent']",
+        ".cookie-accept",
+        ".cookie-consent-accept",
+        ".cc-allow",
+        ".cc-accept",
+        ".cc-btn",
+        ".cookie-banner button",
+        ".cookie-consent button"
+    ];
+    const textMatchers = [
+        /accept/i,
+        /agree/i,
+        /allow all/i,
+        /ok/i,
+        /got it/i,
+        /consent/i,
+        /同意/,
+        /接受/,
+        /允许/,
+        /好的/,
+        /知道了/,
+        /继续/
+    ];
+    const isVisible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        if (!style) return false;
+        if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") {
+            return false;
+        }
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    };
+    const clickIfMatch = (el) => {
+        if (!el || !(el instanceof Element)) return false;
+        if (el.disabled) return false;
+        if (!isVisible(el)) return false;
+        const text = (el.innerText || el.textContent || "").trim();
+        if (!text) return false;
+        if (textMatchers.some((matcher) => matcher.test(text))) {
+            el.click();
+            return true;
+        }
+        return false;
+    };
+    const findAndClick = () => {
+        let clicked = false;
+        for (const sel of selectors) {
+            const nodes = document.querySelectorAll(sel);
+            for (const node of nodes) {
+                if (clickIfMatch(node)) {
+                    clicked = true;
+                    break;
+                }
+            }
+            if (clicked) return true;
+        }
+        const candidates = document.querySelectorAll(
+            "button, [role='button'], input[type='button'], input[type='submit'], a"
+        );
+        for (const node of candidates) {
+            if (clickIfMatch(node)) {
+                clicked = true;
+                break;
+            }
+        }
+        return clicked;
+    };
+    const run = () => {
+        let attempts = 0;
+        const maxAttempts = 20;
+        const intervalMs = 400;
+        const timer = window.setInterval(() => {
+            attempts += 1;
+            const clicked = findAndClick();
+            if (clicked || attempts >= maxAttempts) {
+                window.clearInterval(timer);
+            }
+        }, intervalMs);
+    };
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", run, { once: true });
+    } else {
+        run();
+    }
+    const observer = new MutationObserver(() => {
+        findAndClick();
+    });
+    observer.observe(document.documentElement || document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true
+    });
+})();
+"""
+
 
 @dataclass
 class PageState:
@@ -435,6 +543,7 @@ class AgentBrowser:
         page = await self._context.new_page()
         page.set_default_timeout(self._timeout_ms)
         await page.goto(url, wait_until="domcontentloaded")
+        await page.evaluate(COOKIE_BANNER_JS)
         page_id = await self._register_page(page)
         return f"page_id: {page_id}"
 
