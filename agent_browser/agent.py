@@ -864,7 +864,24 @@ class AgentBrowser:
         return page_id
 
     async def _evaluate_script(self, page: Page, script: str) -> None:
-        await page.evaluate(f"(function(){{{script}}})()")
+        last_error: Exception | None = None
+        for _ in range(2):
+            try:
+                await page.evaluate(f"(function(){{{script}}})()")
+                return
+            except Exception as error:
+                message = str(error)
+                if "Execution context was destroyed" in message or "most likely because of a navigation" in message:
+                    last_error = error
+                    try:
+                        await page.wait_for_load_state("domcontentloaded")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.1)
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
 
     async def _handle_cookie_banner(self, page: Page) -> None:
         selectors = [
@@ -1467,6 +1484,38 @@ class AgentBrowser:
             by section headers.
         """
         state = self._get_state(page_id)
+        options = SnapshotOptions()
+        snapshot_timeout_ms = min(10000, self._timeout_ms)
+        async def build_tree(locator, label: Optional[str] = None, update_refs: bool = False) -> str:
+            try:
+                snapshot = await get_enhanced_snapshot_locator(
+                    locator,
+                    options,
+                    timeout_ms=snapshot_timeout_ms,
+                )
+            except PlaywrightTimeoutError:
+                tree = f"[timeout after {snapshot_timeout_ms}ms]"
+                return f"{label}\n{tree}" if label else tree
+            if update_refs:
+                state.refs = snapshot.refs
+            tree = snapshot.tree
+            return f"{label}\n{tree}" if label else tree
+
+        async def build_root(label: Optional[str] = None, update_refs: bool = False) -> str:
+            try:
+                snapshot = await get_enhanced_snapshot(
+                    state.page,
+                    options,
+                    timeout_ms=snapshot_timeout_ms,
+                )
+            except PlaywrightTimeoutError:
+                tree = f"[timeout after {snapshot_timeout_ms}ms]"
+                return f"{label}\n{tree}" if label else tree
+            if update_refs:
+                state.refs = snapshot.refs
+            tree = snapshot.tree
+            return f"{label}\n{tree}" if label else tree
+
         if selector is None:
             if not path:
                 raise ValueError("需要 path 或 selector")
@@ -1474,32 +1523,41 @@ class AgentBrowser:
             if len(paths) == 1:
                 target_path = paths[0]
                 if target_path in {"0", "root"}:
-                    return await self.snapshot(
-                        page_id,
-                    )
-                aria_tree = await state.page.locator(":root").aria_snapshot()
+                    return await build_root(update_refs=True)
+                try:
+                    aria_tree = await state.page.locator(":root").aria_snapshot(timeout=snapshot_timeout_ms)
+                except PlaywrightTimeoutError:
+                    return f"[timeout after {snapshot_timeout_ms}ms]"
                 locator = resolve_path_locator(state.page, aria_tree, target_path)
-                options = SnapshotOptions()
-                snapshot = await get_enhanced_snapshot_locator(locator, options)
-                state.refs = snapshot.refs
-                return snapshot.tree
-            aria_tree = await state.page.locator(":root").aria_snapshot()
-            options = SnapshotOptions()
+                return await build_tree(locator, update_refs=True)
+            try:
+                aria_tree = await state.page.locator(":root").aria_snapshot(timeout=snapshot_timeout_ms)
+            except PlaywrightTimeoutError:
+                sections = [
+                    f"section (path={target_path})\n[timeout after {snapshot_timeout_ms}ms]"
+                    for target_path in paths
+                ]
+                return "\n\n".join(sections)
             sections: list[str] = []
             for target_path in paths:
                 if target_path in {"0", "root"}:
-                    tree = await self.snapshot()
+                    tree = await build_root()
                 else:
                     locator = resolve_path_locator(state.page, aria_tree, target_path)
-                    snapshot = await get_enhanced_snapshot_locator(locator, options)
-                    tree = snapshot.tree
+                    tree = await build_tree(locator)
                 sections.append(f"section (path={target_path})\n{tree}")
             return "\n\n".join(sections)
-        snapshot = await self.snapshot(
-            page_id,
-            selector=selector,
-        )
-        return snapshot
+        locator = state.page.locator(selector)
+        count = await locator.count()
+        if count == 0:
+            raise ValueError(f"selector 未匹配到元素: {selector}")
+        if count == 1:
+            return await build_tree(locator, update_refs=True)
+        sections: list[str] = []
+        for index in range(count):
+            label = f"section (selector={selector}#{index + 1})"
+            sections.append(await build_tree(locator.nth(index), label=label))
+        return "\n\n".join(sections)
 
     def _resolve_ref_locator(self, state: PageState, ref_id: str):
         if ref_id not in state.refs:
@@ -1516,6 +1574,8 @@ class AgentBrowser:
     def _get_locator(self, state: PageState, selector_or_ref: str):
         if selector_or_ref.startswith("@"):
             return self._resolve_ref_locator(state, selector_or_ref[1:])
+        if re.fullmatch(r"e\d+", selector_or_ref):
+            return self._resolve_ref_locator(state, selector_or_ref)
         return state.page.locator(selector_or_ref)
 
     async def click(self, page_id: str, selector_or_ref: str) -> dict:

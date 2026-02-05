@@ -384,6 +384,26 @@ def resolve_path_locator(page: Page, aria_tree: str, path: str):
     role = node["role"]
     name = node["name"]
     if not name:
+        if role == "text":
+            parent_id = node["parent_id"]
+            while parent_id is not None:
+                parent = nodes[parent_id]
+                if parent["name"] or parent["role"] != "text":
+                    node = parent
+                    role = node["role"]
+                    name = node["name"]
+                    break
+                parent_id = parent["parent_id"]
+            if role == "text" and not name:
+                raise KeyError(f"path 指向 text 节点且无可定位名称: {path}")
+        if name:
+            nth_index = 0
+            for candidate in nodes:
+                if candidate["role"] == role and candidate["name"] == name:
+                    if candidate["id"] == node["id"]:
+                        break
+                    nth_index += 1
+            return page.get_by_role(role, name=name, exact=True).nth(nth_index)
         nth_index = 0
         for candidate in nodes:
             if candidate["role"] == role:
@@ -490,15 +510,29 @@ def _build_snapshot_from_aria_tree(aria_tree: str, options: SnapshotOptions) -> 
     return EnhancedSnapshot(tree="\n".join(result_lines), refs=refs)
 
 
-async def get_enhanced_snapshot(page: Page, options: SnapshotOptions) -> EnhancedSnapshot:
+async def get_enhanced_snapshot(
+    page: Page,
+    options: SnapshotOptions,
+    timeout_ms: Optional[int] = None,
+) -> EnhancedSnapshot:
     """
     基于 ARIA 树生成可读快照，并为可交互元素生成可复用的 ref。
     """
     locator = page.locator(options.selector) if options.selector else page.locator(":root")
-    aria_tree = await locator.aria_snapshot()
+    if timeout_ms is None:
+        aria_tree = await locator.aria_snapshot()
+    else:
+        aria_tree = await locator.aria_snapshot(timeout=timeout_ms)
     return _build_snapshot_from_aria_tree(aria_tree, options)
 
 
-async def get_enhanced_snapshot_locator(locator, options: SnapshotOptions) -> EnhancedSnapshot:
-    aria_tree = await locator.aria_snapshot()
+async def get_enhanced_snapshot_locator(
+    locator,
+    options: SnapshotOptions,
+    timeout_ms: Optional[int] = None,
+) -> EnhancedSnapshot:
+    if timeout_ms is None:
+        aria_tree = await locator.aria_snapshot()
+    else:
+        aria_tree = await locator.aria_snapshot(timeout=timeout_ms)
     return _build_snapshot_from_aria_tree(aria_tree, options)
