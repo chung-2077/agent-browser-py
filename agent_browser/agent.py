@@ -9,9 +9,116 @@ from patchright.async_api import Browser, BrowserContext, Page, TimeoutError as 
 
 from .console import ConsoleRecorder, ConsoleStreamServer
 from .errors import to_ai_friendly_error
-from .snapshot import EnhancedSnapshot, SnapshotOptions, get_enhanced_snapshot
+from .snapshot import EnhancedSnapshot, SnapshotOptions, get_enhanced_snapshot, get_enhanced_snapshot_locator, build_snapshot_index_text, resolve_path_locator, search_snapshot_index_text
 from .storage import cookies_clear, cookies_get, cookies_set, storage_clear, storage_get, storage_set
 from .streaming import StreamServer
+
+
+def build_llm_method_tutorial(method_names: Iterable[str]) -> str:
+    """
+    Build concise LLM-facing usage guidance for selected AgentBrowser methods.
+    """
+    llm_excluded = {
+        "start",
+        "cookies_get",
+        "cookies_set",
+        "cookies_clear",
+        "storage_get",
+        "storage_set",
+        "storage_clear",
+        "console_get",
+        "console_stream_start",
+        "console_stream_stop",
+        "stream_start",
+        "stream_stop",
+        "stream_inject_mouse",
+        "stream_inject_keyboard",
+        "stream_inject_touch",
+        "close",
+        "screenshot"
+    }
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for name in method_names:
+        if not name:
+            continue
+        normalized = name.strip()
+        if normalized in llm_excluded:
+            continue
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    if not ordered:
+        return ""
+
+    selector_methods = {
+        "click",
+        "fill",
+        "select",
+        "press",
+        "check",
+        "uncheck",
+        "upload",
+        "inner_html",
+    }
+    needs_page_id = {
+        "snapshot",
+        "snapshot_index",
+        "snapshot_search",
+        "snapshot_section_snapshot",
+        "click",
+        "fill",
+        "select",
+        "press",
+        "check",
+        "uncheck",
+        "upload",
+        "inner_html",
+        "find",
+        "back",
+        "get_url",
+        "get_title",
+    }
+    tutorials: dict[str, str] = {
+        "open": "open(url): Open a new page and navigate to url, returns page_id.",
+        "snapshot": "snapshot(page_id, ...): Get a readable snapshot and stable @eN refs.",
+        "snapshot_index": "snapshot_index(page_id, ...): Return a hierarchical index with paths.",
+        "snapshot_search": "snapshot_search(page_id, query, ...): Search the index text and return matched paths.",
+        "snapshot_section_snapshot": "snapshot_section_snapshot(page_id, path, ...): Get a section snapshot by path or selector.",
+        "click": "click(page_id, selector_or_ref): Click an element.",
+        "fill": "fill(page_id, selector_or_ref, text): Fill text into an element.",
+        "select": "select(page_id, selector_or_ref, value): Select an option value.",
+        "press": "press(page_id, selector_or_ref, key): Press a key on an element.",
+        "check": "check(page_id, selector_or_ref): Check a checkbox.",
+        "uncheck": "uncheck(page_id, selector_or_ref): Uncheck a checkbox.",
+        "upload": "upload(page_id, selector_or_ref, files): Upload local files.",
+        "inner_html": "inner_html(page_id, selector_or_ref): Get the element HTML.",
+        "find": "find(page_id, strategy, action, ...): Unified locate+action, pass action_value/files when needed.",
+        "back": "back(page_id, steps=1): Navigate back in history.",
+        "get_url": "get_url(page_id): Get the current page URL.",
+        "get_title": "get_title(page_id): Get the current page title.",
+    }
+
+    lines: list[str] = []
+    if any(name in needs_page_id for name in ordered):
+        lines.append("General: Methods except open require page_id from open().")
+    if any(name in selector_methods for name in ordered):
+        lines.append("General: Use snapshot(..., interactive=True) to get @eN, then pass @eN or standard CSS selectors.")
+        lines.append("Selector note: AgentBrowser uses Playwright locators; prefer @eN refs.")
+    if any(
+        name in {"snapshot_index", "snapshot_search", "snapshot_section_snapshot"}
+        for name in ordered
+    ):
+        lines.append("Index: snapshot_index returns hierarchical paths; long labels are truncated and deep nodes are collapsed.")
+        lines.append("Search: snapshot_search can be called repeatedly to narrow scope and find parent/neighbor paths.")
+        lines.append("Section: snapshot_section_snapshot accepts one or multiple paths and returns actionable text with refs.")
+        lines.append("Flow: index/search to find paths -> section snapshot to view regions -> use @eN actions.")
+    for name in ordered:
+        guide = tutorials.get(name)
+        if guide:
+            lines.append(f"- {guide}")
+    return "\n".join(lines)
 
 
 STEALTH_JS = """
@@ -1276,9 +1383,127 @@ class AgentBrowser:
         state.refs = snapshot.refs
         return snapshot.tree
 
+    async def snapshot_index(
+        self,
+        page_id: str,
+        path: Optional[str] = None,
+        depth: int = 1,
+        max_nodes: int = 200,
+        text_limit: int = 80,
+    ) -> str:
+        """
+        Build a compact hierarchical index of the page.
+
+        Args:
+            page_id: Target page id returned by open().
+            path: Optional index path to expand from. Use "root" or "0" for full page.
+            depth: Depth to expand from the start node.
+            max_nodes: Maximum number of nodes to return.
+            text_limit: Max length for node labels and summaries.
+
+        Returns:
+            A human-readable index text with paths for navigation.
+        """
+        state = self._get_state(page_id)
+        aria_tree = await state.page.locator(":root").aria_snapshot()
+        return build_snapshot_index_text(
+            aria_tree,
+            path=path,
+            depth=depth,
+            max_nodes=max_nodes,
+            text_limit=text_limit,
+        )
+
+    async def snapshot_search(
+        self,
+        page_id: str,
+        query: str,
+        mode: str = "fuzzy",
+        limit: int = 50,
+        text_limit: int = 80,
+    ) -> str:
+        """
+        Search index nodes by fuzzy text or regex.
+
+        Args:
+            page_id: Target page id returned by open().
+            query: Search keyword or regex pattern.
+            mode: "fuzzy" for substring match, "regex" for regular expression.
+            limit: Maximum number of matches to return.
+            text_limit: Max length for node labels.
+
+        Returns:
+            A human-readable list of matching nodes with their paths.
+        """
+        state = self._get_state(page_id)
+        aria_tree = await state.page.locator(":root").aria_snapshot()
+        return search_snapshot_index_text(
+            aria_tree,
+            query=query,
+            mode=mode,
+            limit=limit,
+            text_limit=text_limit,
+        )
+
+    async def snapshot_section_snapshot(
+        self,
+        page_id: str,
+        path: Optional[str] = None,
+        selector: Optional[str] = None,
+    ) -> str:
+        """
+        Get a section snapshot by index path(s) or selector.
+
+        Args:
+            page_id: Target page id returned by open().
+            path: Index path. e.g. ["0/1","0/2"]
+            selector: Optional CSS selector to scope the snapshot.
+            interactive: If True, only include interactive elements.
+            max_depth: Optional maximum tree depth to include.
+            compact: If True, filter out purely structural unnamed nodes.
+
+        Returns:
+            One or more section snapshots as text. Multiple paths are separated
+            by section headers.
+        """
+        state = self._get_state(page_id)
+        if selector is None:
+            if not path:
+                raise ValueError("需要 path 或 selector")
+            paths = [p for p in re.split(r"[,\s]+", path.strip()) if p]
+            if len(paths) == 1:
+                target_path = paths[0]
+                if target_path in {"0", "root"}:
+                    return await self.snapshot(
+                        page_id,
+                    )
+                aria_tree = await state.page.locator(":root").aria_snapshot()
+                locator = resolve_path_locator(state.page, aria_tree, target_path)
+                options = SnapshotOptions()
+                snapshot = await get_enhanced_snapshot_locator(locator, options)
+                state.refs = snapshot.refs
+                return snapshot.tree
+            aria_tree = await state.page.locator(":root").aria_snapshot()
+            options = SnapshotOptions()
+            sections: list[str] = []
+            for target_path in paths:
+                if target_path in {"0", "root"}:
+                    tree = await self.snapshot()
+                else:
+                    locator = resolve_path_locator(state.page, aria_tree, target_path)
+                    snapshot = await get_enhanced_snapshot_locator(locator, options)
+                    tree = snapshot.tree
+                sections.append(f"section (path={target_path})\n{tree}")
+            return "\n\n".join(sections)
+        snapshot = await self.snapshot(
+            page_id,
+            selector=selector,
+        )
+        return snapshot
+
     def _resolve_ref_locator(self, state: PageState, ref_id: str):
         if ref_id not in state.refs:
-            raise KeyError(f"未知的 ref: {ref_id}")
+            raise KeyError(f"Unknown ref: {ref_id}")
         target = state.refs[ref_id]
         if target.name:
             locator = state.page.get_by_role(target.role, name=target.name, exact=True)

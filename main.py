@@ -33,6 +33,19 @@ def _parse_options(tokens: list[str]) -> dict:
     return options
 
 
+def _parse_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 async def cli() -> None:
     # 简单的参数解析
     headless = "--headless" in sys.argv
@@ -89,6 +102,9 @@ async def cli() -> None:
                             "upload <selector_or_ref> <file1> [file2...]",
                             "inner_html <selector_or_ref>",
                             "find <strategy> <action> [--value v] [--name n] [--selector s] [--nth n] [--action-value v] [--file f]",
+                            "snapshot_index [--path p] [--depth n] [--max_nodes n] [--text_limit n]",
+                            "snapshot_search <query> [--mode fuzzy|regex] [--limit n] [--text_limit n]",
+                            "snapshot_section [--path p] [--selector s] [--interactive true|false] [--max_depth n] [--compact true|false]",
                             "stream_start [--dir output] [--format jpeg|png] [--quality q] [--every_nth n]",
                             "stream_stop",
                             "close [page_id]",
@@ -229,6 +245,40 @@ async def cli() -> None:
                     )
                     if result is not None:
                         print(result)
+                elif command == "snapshot_index":
+                    page_id = await require_page()
+                    options = _parse_options(args)
+                    result = await browser.snapshot_index(
+                        page_id,
+                        path=options.get("path"),
+                        depth=int(options["depth"]) if "depth" in options else 3,
+                        max_nodes=int(options["max_nodes"]) if "max_nodes" in options else 200,
+                        text_limit=int(options["text_limit"]) if "text_limit" in options else 80,
+                    )
+                    print(result)
+                elif command == "snapshot_search":
+                    page_id = await require_page()
+                    if not args:
+                        raise ValueError("snapshot_search 需要 query")
+                    query = args[0]
+                    options = _parse_options(args[1:])
+                    result = await browser.snapshot_search(
+                        page_id,
+                        query=query,
+                        mode=str(options.get("mode", "fuzzy")),
+                        limit=int(options["limit"]) if "limit" in options else 50,
+                        text_limit=int(options["text_limit"]) if "text_limit" in options else 80,
+                    )
+                    print(result)
+                elif command == "snapshot_section":
+                    page_id = await require_page()
+                    options = _parse_options(args)
+                    result = await browser.snapshot_section_snapshot(
+                        page_id,
+                        path=options.get("path"),
+                        selector=options.get("selector"),
+                    )
+                    print(result)
                 elif command == "stream_start":
                     options = _parse_options(args)
                     output_dir = Path(options.get("dir", "frames"))
