@@ -587,12 +587,15 @@ COOKIE_BANNER_JS = """
             observer.disconnect();
         }
     });
-    observer.observe(document.documentElement || document.body, {
-        childList: true,
-        subtree: true,
-        attributes: true
-    });
-    window.setTimeout(() => observer.disconnect(), 8000);
+    const root = document.documentElement || document.body;
+    if (root) {
+        observer.observe(root, {
+            childList: true,
+            subtree: true,
+            attributes: true
+        });
+        window.setTimeout(() => observer.disconnect(), 8000);
+    }
 })();
 """
 
@@ -713,12 +716,15 @@ POPUP_GUARD_JS = """
     const observer = new MutationObserver(() => {
         findAndClick();
     });
-    observer.observe(document.documentElement || document.body, {
-        childList: true,
-        subtree: true,
-        attributes: true
-    });
-    window.setTimeout(() => observer.disconnect(), 12000);
+    const root = document.documentElement || document.body;
+    if (root) {
+        observer.observe(root, {
+            childList: true,
+            subtree: true,
+            attributes: true
+        });
+        window.setTimeout(() => observer.disconnect(), 12000);
+    }
 })();
 """
 
