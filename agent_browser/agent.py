@@ -1394,11 +1394,49 @@ class AgentBrowser:
             interactive=interactive,
             max_depth=max_depth,
             compact=compact,
-            selector=selector,
         )
-        snapshot = await get_enhanced_snapshot(state.page, options)
-        state.refs = snapshot.refs
-        return snapshot.tree
+        snapshot_timeout_ms = min(10000, self._timeout_ms)
+        if not selector:
+            try:
+                snapshot = await get_enhanced_snapshot(
+                    state.page,
+                    options,
+                    timeout_ms=snapshot_timeout_ms,
+                )
+            except PlaywrightTimeoutError:
+                return f"[timeout after {snapshot_timeout_ms}ms]"
+            state.refs = snapshot.refs
+            return snapshot.tree
+        locator = state.page.locator(selector)
+        count = await locator.count()
+        if count == 0:
+            raise ValueError(f"Selector matched no elements: {selector}")
+        if count == 1:
+            try:
+                snapshot = await get_enhanced_snapshot_locator(
+                    locator,
+                    options,
+                    timeout_ms=snapshot_timeout_ms,
+                )
+            except PlaywrightTimeoutError:
+                return f"[timeout after {snapshot_timeout_ms}ms]"
+            state.refs = snapshot.refs
+            return snapshot.tree
+        sections: list[str] = []
+        for index in range(count):
+            try:
+                snapshot = await get_enhanced_snapshot_locator(
+                    locator.nth(index),
+                    options,
+                    timeout_ms=snapshot_timeout_ms,
+                )
+                sections.append(f"section (selector={selector}#{index + 1})\n{snapshot.tree}")
+            except PlaywrightTimeoutError:
+                sections.append(
+                    f"section (selector={selector}#{index + 1})\n[timeout after {snapshot_timeout_ms}ms]"
+                )
+        note = f'Note: selector "{selector}" matched {count} elements; rendering in order.'
+        return "\n".join([note, "", *sections])
 
     async def snapshot_index(
         self,
@@ -1550,14 +1588,15 @@ class AgentBrowser:
         locator = state.page.locator(selector)
         count = await locator.count()
         if count == 0:
-            raise ValueError(f"selector 未匹配到元素: {selector}")
+            raise ValueError(f"Selector matched no elements: {selector}")
         if count == 1:
             return await build_tree(locator, update_refs=True)
         sections: list[str] = []
         for index in range(count):
             label = f"section (selector={selector}#{index + 1})"
             sections.append(await build_tree(locator.nth(index), label=label))
-        return "\n\n".join(sections)
+        note = f'Note: selector "{selector}" matched {count} elements; rendering in order.'
+        return "\n".join([note, "", *sections])
 
     def _resolve_ref_locator(self, state: PageState, ref_id: str):
         if ref_id not in state.refs:
@@ -1571,12 +1610,51 @@ class AgentBrowser:
             locator = locator.nth(target.nth)
         return locator
 
-    def _get_locator(self, state: PageState, selector_or_ref: str):
+    def _is_path(self, selector_or_ref: str) -> bool:
+        if "/" in selector_or_ref:
+            return True
+        return re.fullmatch(r"\d+", selector_or_ref) is not None
+
+    async def _resolve_path_locator(self, state: PageState, path: str):
+        snapshot_timeout_ms = min(10000, self._timeout_ms)
+        try:
+            aria_tree = await state.page.locator(":root").aria_snapshot(timeout=snapshot_timeout_ms)
+        except PlaywrightTimeoutError as error:
+            raise ValueError(f"Path snapshot timed out after {snapshot_timeout_ms}ms") from error
+        return resolve_path_locator(state.page, aria_tree, path)
+
+    async def _get_locator_text(self, locator) -> Optional[str]:
+        try:
+            text = await locator.inner_text()
+        except Exception:
+            try:
+                text = await locator.text_content()
+            except Exception:
+                return None
+        if not text:
+            return None
+        compact = " ".join(text.split())
+        if len(compact) > 80:
+            return f"{compact[:80]}…"
+        return compact
+
+    async def _get_locator_with_note(self, state: PageState, selector_or_ref: str):
         if selector_or_ref.startswith("@"):
-            return self._resolve_ref_locator(state, selector_or_ref[1:])
+            return self._resolve_ref_locator(state, selector_or_ref[1:]), None
         if re.fullmatch(r"e\d+", selector_or_ref):
-            return self._resolve_ref_locator(state, selector_or_ref)
-        return state.page.locator(selector_or_ref)
+            return self._resolve_ref_locator(state, selector_or_ref), None
+        if self._is_path(selector_or_ref):
+            locator = await self._resolve_path_locator(state, selector_or_ref)
+            return locator, None
+        locator = state.page.locator(selector_or_ref)
+        count = await locator.count()
+        if count <= 1:
+            return locator, None
+        preview_text = await self._get_locator_text(locator.first)
+        note = f'Selector "{selector_or_ref}" matched {count} elements; defaulting to the first.'
+        if preview_text:
+            note = f"{note} First element text: {preview_text}"
+        return locator.first, note
 
     async def click(self, page_id: str, selector_or_ref: str) -> dict:
         """
@@ -1590,8 +1668,11 @@ class AgentBrowser:
             A dict describing what happened (url change, popup, download).
         """
         state = self._get_state(page_id)
-        locator = self._get_locator(state, selector_or_ref)
-        return await self._click_locator(state, locator, selector=selector_or_ref)
+        locator, note = await self._get_locator_with_note(state, selector_or_ref)
+        result = await self._click_locator(state, locator, selector=selector_or_ref)
+        if note:
+            result["note"] = note
+        return result
 
     async def _click_locator(self, state: PageState, locator, selector: str) -> dict:
         url_before = state.page.url
@@ -1683,13 +1764,16 @@ class AgentBrowser:
             A dict describing what happened, including the resulting value.
         """
         state = self._get_state(page_id)
-        locator = self._get_locator(state, selector_or_ref)
+        locator, note = await self._get_locator_with_note(state, selector_or_ref)
         try:
             await locator.fill(text)
             value = await locator.input_value()
         except Exception as error:
             raise to_ai_friendly_error(error, selector_or_ref) from error
-        return {"filled": True, "value": value, "url": state.page.url}
+        result = {"filled": True, "value": value, "url": state.page.url}
+        if note:
+            result["note"] = note
+        return result
 
     async def select(self, page_id: str, selector_or_ref: str, value: str) -> dict:
         """
@@ -1704,13 +1788,16 @@ class AgentBrowser:
             A dict describing what happened, including the resulting value.
         """
         state = self._get_state(page_id)
-        locator = self._get_locator(state, selector_or_ref)
+        locator, note = await self._get_locator_with_note(state, selector_or_ref)
         try:
             await locator.select_option(value=value)
             selected = await locator.input_value()
         except Exception as error:
             raise to_ai_friendly_error(error, selector_or_ref) from error
-        return {"selected": True, "value": selected, "url": state.page.url}
+        result = {"selected": True, "value": selected, "url": state.page.url}
+        if note:
+            result["note"] = note
+        return result
 
     async def press(self, page_id: str, selector_or_ref: str, key: str) -> dict:
         """
@@ -1725,7 +1812,7 @@ class AgentBrowser:
             A dict describing what happened (e.g. url change).
         """
         state = self._get_state(page_id)
-        locator = self._get_locator(state, selector_or_ref)
+        locator, note = await self._get_locator_with_note(state, selector_or_ref)
         url_before = state.page.url
         try:
             await locator.press(key)
@@ -1735,7 +1822,10 @@ class AgentBrowser:
                 pass
         except Exception as error:
             raise to_ai_friendly_error(error, selector_or_ref) from error
-        return {"pressed": True, "url_before": url_before, "url_after": state.page.url}
+        result = {"pressed": True, "url_before": url_before, "url_after": state.page.url}
+        if note:
+            result["note"] = note
+        return result
 
     async def check(self, page_id: str, selector_or_ref: str) -> dict:
         """
@@ -1749,13 +1839,16 @@ class AgentBrowser:
             A dict describing what happened, including current checked state.
         """
         state = self._get_state(page_id)
-        locator = self._get_locator(state, selector_or_ref)
+        locator, note = await self._get_locator_with_note(state, selector_or_ref)
         try:
             await locator.check()
             checked = await locator.is_checked()
         except Exception as error:
             raise to_ai_friendly_error(error, selector_or_ref) from error
-        return {"checked": True, "is_checked": checked, "url": state.page.url}
+        result = {"checked": True, "is_checked": checked, "url": state.page.url}
+        if note:
+            result["note"] = note
+        return result
 
     async def uncheck(self, page_id: str, selector_or_ref: str) -> dict:
         """
@@ -1769,13 +1862,16 @@ class AgentBrowser:
             A dict describing what happened, including current checked state.
         """
         state = self._get_state(page_id)
-        locator = self._get_locator(state, selector_or_ref)
+        locator, note = await self._get_locator_with_note(state, selector_or_ref)
         try:
             await locator.uncheck()
             checked = await locator.is_checked()
         except Exception as error:
             raise to_ai_friendly_error(error, selector_or_ref) from error
-        return {"unchecked": True, "is_checked": checked, "url": state.page.url}
+        result = {"unchecked": True, "is_checked": checked, "url": state.page.url}
+        if note:
+            result["note"] = note
+        return result
 
     async def upload(self, page_id: str, selector_or_ref: str, files: Iterable[str]) -> dict:
         """
@@ -1790,12 +1886,15 @@ class AgentBrowser:
             A dict describing what happened.
         """
         state = self._get_state(page_id)
-        locator = self._get_locator(state, selector_or_ref)
+        locator, note = await self._get_locator_with_note(state, selector_or_ref)
         try:
             await locator.set_input_files(list(files))
         except Exception as error:
             raise to_ai_friendly_error(error, selector_or_ref) from error
-        return {"uploaded": True, "url": state.page.url}
+        result = {"uploaded": True, "url": state.page.url}
+        if note:
+            result["note"] = note
+        return result
 
     async def inner_html(self, page_id: str, selector_or_ref: str) -> str:
         """
@@ -1809,11 +1908,15 @@ class AgentBrowser:
             The element's innerHTML.
         """
         state = self._get_state(page_id)
-        locator = self._get_locator(state, selector_or_ref)
+        locator, note = await self._get_locator_with_note(state, selector_or_ref)
         try:
-            return await locator.inner_html()
+            html = await locator.inner_html()
         except Exception as error:
             raise to_ai_friendly_error(error, selector_or_ref) from error
+        result = {"html": html}
+        if note:
+            result["note"] = note
+        return result
 
     async def screenshot(self, page_id: str, path: str, full_page: bool = True) -> None:
         """
