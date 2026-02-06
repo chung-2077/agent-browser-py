@@ -745,7 +745,8 @@ class AgentBrowser:
         headless: bool = True,
         viewport: tuple[int, int] = (1280, 720),
         user_agent: Optional[str] = None,
-        timeout_ms: int = 30000,
+        timeout_ms: int = 10000,
+        open_timeout_ms: int = 15000,
         locale: Optional[str] = None,
         timezone: Optional[str] = None,
         use_system_chrome: bool = False,
@@ -760,6 +761,7 @@ class AgentBrowser:
             viewport: Default viewport size as (width, height).
             user_agent: Custom user agent string for the browser context.
             timeout_ms: Default timeout (ms) for Playwright operations.
+            open_timeout_ms: Timeout (ms) for open() navigation.
             locale: Browser context locale.
             timezone: Browser context timezone id.
             use_system_chrome: Whether to launch system Chrome instead of bundled Chromium.
@@ -771,6 +773,7 @@ class AgentBrowser:
         self._viewport = viewport
         self._user_agent = user_agent
         self._timeout_ms = timeout_ms
+        self._open_timeout_ms = open_timeout_ms
         self._locale = locale
         self._timezone = timezone
         self._use_system_chrome = use_system_chrome
@@ -853,7 +856,7 @@ class AgentBrowser:
             raise RuntimeError("浏览器上下文未初始化")
         page = await self._context.new_page()
         page.set_default_timeout(self._timeout_ms)
-        await page.goto(url, wait_until="domcontentloaded")
+        await page.goto(url, wait_until="domcontentloaded", timeout=self._open_timeout_ms)
         if self._stealth_js:
             await self._evaluate_script(page, self._stealth_js)
         await self._evaluate_script(page, COOKIE_BANNER_JS)
@@ -882,6 +885,29 @@ class AgentBrowser:
                 raise
         if last_error is not None:
             raise last_error
+
+    async def _maybe_has_cookie_banner(self, page: Page, selectors: list[str]) -> bool:
+        selector_union = ",".join(selectors)
+        script = """
+        (selectorUnion) => {
+            const dialog = document.querySelector("[role='dialog']");
+            if (dialog) return true;
+            const ariaCookie = document.querySelector("[role='dialog'][aria-label*='cookie' i], [role='dialog'][aria-label*='consent' i]");
+            if (ariaCookie) return true;
+            const hint = document.querySelector("[id*='cookie' i], [class*='cookie' i], [id*='consent' i], [class*='consent' i]");
+            if (hint) return true;
+            if (!selectorUnion) return false;
+            try {
+                return document.querySelector(selectorUnion) !== null;
+            } catch (e) {
+                return true;
+            }
+        }
+        """
+        try:
+            return await page.evaluate(script, selector_union)
+        except Exception:
+            return True
 
     async def _handle_cookie_banner(self, page: Page) -> None:
         selectors = [
@@ -1033,7 +1059,11 @@ class AgentBrowser:
             re.compile(r"暂不", re.I),
             re.compile(r"以后", re.I),
         ]
-        for _ in range(6):
+        has_hint = await self._maybe_has_cookie_banner(page, selectors)
+        if not has_hint and len(page.frames) <= 1:
+            return
+        deadline = asyncio.get_event_loop().time() + 0.7
+        while True:
             if await self._try_click_cookie(
                 page,
                 selectors,
@@ -1043,7 +1073,9 @@ class AgentBrowser:
                 close_texts=close_texts,
             ):
                 break
-            await asyncio.sleep(0.3)
+            if asyncio.get_event_loop().time() >= deadline:
+                break
+            await asyncio.sleep(0.15)
 
     async def _handle_popups(self, page: Page) -> bool:
         selectors = [
