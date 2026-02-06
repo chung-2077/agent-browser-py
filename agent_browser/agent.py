@@ -867,8 +867,8 @@ class AgentBrowser:
             await self._evaluate_script(page, self._stealth_js)
         await self._evaluate_script(page, COOKIE_BANNER_JS)
         await self._handle_cookie_banner(page)
-        await self._evaluate_script(page, POPUP_GUARD_JS)
-        await self._handle_popups(page)
+        # await self._evaluate_script(page, POPUP_GUARD_JS)
+        # await self._handle_popups(page)
         page_id = await self._register_page(page)
         return page_id
 
