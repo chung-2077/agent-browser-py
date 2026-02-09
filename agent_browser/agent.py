@@ -9,7 +9,7 @@ from patchright.async_api import Browser, BrowserContext, Page, TimeoutError as 
 
 from .console import ConsoleRecorder, ConsoleStreamServer
 from .errors import to_ai_friendly_error
-from .snapshot import EnhancedSnapshot, SnapshotOptions, get_enhanced_snapshot, get_enhanced_snapshot_locator, build_snapshot_index_text, resolve_path_locator, search_snapshot_index_text
+from .snapshot import EnhancedSnapshot, SnapshotOptions, get_enhanced_snapshot, get_enhanced_snapshot_locator, build_snapshot_index_text, resolve_path_locator, search_snapshot_index_text, get_multiview_index_data, build_multiview_index_text, search_multiview_index_text
 from .storage import cookies_clear, cookies_get, cookies_set, storage_clear, storage_get, storage_set
 from .streaming import StreamServer
 
@@ -736,6 +736,7 @@ class PageState:
     console: ConsoleRecorder = field(default_factory=ConsoleRecorder)
     stream_server: Optional[StreamServer] = None
     console_server: Optional[ConsoleStreamServer] = None
+    index_paths: Dict[str, str] = field(default_factory=dict)
 
 
 class AgentBrowser:
@@ -865,8 +866,8 @@ class AgentBrowser:
         await page.goto(url, wait_until="domcontentloaded", timeout=self._open_timeout_ms)
         if self._stealth_js:
             await self._evaluate_script(page, self._stealth_js)
-        await self._evaluate_script(page, COOKIE_BANNER_JS)
-        await self._handle_cookie_banner(page)
+        # await self._evaluate_script(page, COOKIE_BANNER_JS)
+        # await self._handle_cookie_banner(page)
         # await self._evaluate_script(page, POPUP_GUARD_JS)
         # await self._handle_popups(page)
         page_id = await self._register_page(page)
@@ -1482,7 +1483,7 @@ class AgentBrowser:
         path: Optional[str] = None,
         depth: int = 1,
         max_nodes: int = 200,
-        text_limit: int = 80,
+        text_limit: int = 180,
     ) -> str:
         """
         Build a compact hierarchical index of the page.
@@ -1499,13 +1500,33 @@ class AgentBrowser:
         """
         state = self._get_state(page_id)
         aria_tree = await state.page.locator(":root").aria_snapshot()
-        return build_snapshot_index_text(
+        view_path = self._normalize_path(path) if path else None
+        multiview_data = await get_multiview_index_data(
+            state.page,
+            text_limit=text_limit,
+            max_nodes=max_nodes,
+            depth=depth,
+        )
+        multiview_text, view_paths = build_multiview_index_text(
+            multiview_data,
+            path=view_path if view_path and view_path.startswith("v:") else None,
+            depth=depth,
+            max_nodes=max_nodes,
+            text_limit=text_limit,
+        )
+        state.index_paths = view_paths
+        if view_path and view_path.startswith("v:"):
+            return multiview_text
+        aria_text = build_snapshot_index_text(
             aria_tree,
             path=path,
             depth=depth,
             max_nodes=max_nodes,
             text_limit=text_limit,
         )
+        if multiview_text and multiview_text != "(empty)":
+            return "\n\n".join([multiview_text, aria_text])
+        return aria_text
 
     async def snapshot_search(
         self,
@@ -1530,13 +1551,42 @@ class AgentBrowser:
         """
         state = self._get_state(page_id)
         aria_tree = await state.page.locator(":root").aria_snapshot()
-        return search_snapshot_index_text(
+        multiview_data = await get_multiview_index_data(
+            state.page,
+            text_limit=text_limit,
+            max_nodes=limit,
+            depth=6,
+        )
+        _, view_paths = build_multiview_index_text(
+            multiview_data,
+            path=None,
+            depth=6,
+            max_nodes=limit,
+            text_limit=text_limit,
+        )
+        state.index_paths = view_paths
+        multiview_results = search_multiview_index_text(
+            multiview_data,
+            query=query,
+            mode=mode,
+            limit=limit,
+            text_limit=text_limit,
+        )
+        aria_results = search_snapshot_index_text(
             aria_tree,
             query=query,
             mode=mode,
             limit=limit,
             text_limit=text_limit,
         )
+        if multiview_results.endswith("(empty)") and aria_results.endswith("(empty)"):
+            return multiview_results
+        if multiview_results.endswith("(empty)"):
+            return aria_results
+        if aria_results.endswith("(empty)"):
+            return multiview_results
+        header = f'search (query="{query}", mode={mode}, limit={limit})'
+        return "\n".join([header, "view=multiview", *multiview_results.splitlines()[1:], "view=aria", *aria_results.splitlines()[1:]])
 
     async def snapshot_section_snapshot(
         self,
@@ -1595,31 +1645,26 @@ class AgentBrowser:
         if selector is None:
             if not path:
                 raise ValueError("需要 path 或 selector")
-            paths = [p for p in re.split(r"[,\s]+", path.strip()) if p]
+            tokens = [p for p in re.split(r"[,\s]+", path.strip()) if p]
+            paths = []
+            for token in tokens:
+                cleaned = self._normalize_path(token)
+                if cleaned:
+                    paths.append(cleaned)
+            if not paths:
+                raise ValueError("需要有效的 path 或 selector")
             if len(paths) == 1:
                 target_path = paths[0]
                 if target_path in {"0", "root"}:
                     return await build_root(update_refs=True)
-                try:
-                    aria_tree = await state.page.locator(":root").aria_snapshot(timeout=snapshot_timeout_ms)
-                except PlaywrightTimeoutError:
-                    return f"[timeout after {snapshot_timeout_ms}ms]"
-                locator = resolve_path_locator(state.page, aria_tree, target_path)
+                locator = await self._resolve_path_locator(state, target_path)
                 return await build_tree(locator, update_refs=True)
-            try:
-                aria_tree = await state.page.locator(":root").aria_snapshot(timeout=snapshot_timeout_ms)
-            except PlaywrightTimeoutError:
-                sections = [
-                    f"section (path={target_path})\n[timeout after {snapshot_timeout_ms}ms]"
-                    for target_path in paths
-                ]
-                return "\n\n".join(sections)
             sections: list[str] = []
             for target_path in paths:
                 if target_path in {"0", "root"}:
                     tree = await build_root()
                 else:
-                    locator = resolve_path_locator(state.page, aria_tree, target_path)
+                    locator = await self._resolve_path_locator(state, target_path)
                     tree = await build_tree(locator)
                 sections.append(f"section (path={target_path})\n{tree}")
             return "\n\n".join(sections)
@@ -1649,17 +1694,50 @@ class AgentBrowser:
         return locator
 
     def _is_path(self, selector_or_ref: str) -> bool:
-        if "/" in selector_or_ref:
-            return True
-        return re.fullmatch(r"\d+", selector_or_ref) is not None
+        normalized = self._normalize_path(selector_or_ref)
+        return normalized is not None
+
+    def _normalize_path(self, raw: str) -> Optional[str]:
+        t = raw.strip().strip(' \'"')
+        match = re.match(r"^\[?path=([^\]]+)\]?$", t)
+        if match:
+            t = match.group(1).strip()
+        t2 = t.strip("[]")
+        if t2 in {"root", "0"}:
+            return t2
+        if re.fullmatch(r"\d+(?:/\d+)*", t2):
+            return t2
+        if re.fullmatch(r"v:(structure|content|interact|overlay)/[sbio]\d+", t2):
+            return t2
+        return None
 
     async def _resolve_path_locator(self, state: PageState, path: str):
+        normalized = self._normalize_path(path) or path
+        if normalized.startswith("v:"):
+            if normalized not in state.index_paths:
+                multiview_data = await get_multiview_index_data(
+                    state.page,
+                    text_limit=80,
+                    max_nodes=200,
+                    depth=6,
+                )
+                _, view_paths = build_multiview_index_text(
+                    multiview_data,
+                    path=None,
+                    depth=6,
+                    max_nodes=200,
+                    text_limit=80,
+                )
+                state.index_paths = view_paths
+            if normalized not in state.index_paths:
+                raise KeyError(f"未知的 path: {normalized}")
+            return state.page.locator(state.index_paths[normalized])
         snapshot_timeout_ms = min(10000, self._timeout_ms)
         try:
             aria_tree = await state.page.locator(":root").aria_snapshot(timeout=snapshot_timeout_ms)
         except PlaywrightTimeoutError as error:
             raise ValueError(f"Path snapshot timed out after {snapshot_timeout_ms}ms") from error
-        return resolve_path_locator(state.page, aria_tree, path)
+        return resolve_path_locator(state.page, aria_tree, normalized)
 
     async def _get_locator_text(self, locator) -> Optional[str]:
         try:

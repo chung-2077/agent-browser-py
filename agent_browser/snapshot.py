@@ -114,6 +114,456 @@ def _truncate_text(text: str, limit: int) -> str:
     return f"{text[:limit]}…"
 
 
+def _match_snippet(text: str, query: str, mode: str, limit: int) -> str:
+    if not text:
+        return ""
+    if mode == "regex":
+        try:
+            pattern = re.compile(query, re.I)
+        except re.error:
+            return _truncate_text(text, limit)
+        match = pattern.search(text)
+        if not match:
+            return _truncate_text(text, limit)
+        start, end = match.span()
+    else:
+        lower = text.lower()
+        needle = query.lower()
+        start = lower.find(needle)
+        if start < 0:
+            return _truncate_text(text, limit)
+        end = start + len(needle)
+    context = max(8, limit // 3)
+    left = max(0, start - context)
+    right = min(len(text), end + context)
+    snippet = text[left:right]
+    if left > 0:
+        snippet = f"…{snippet}"
+    if right < len(text):
+        snippet = f"{snippet}…"
+    return _truncate_text(snippet, limit)
+
+
+async def get_multiview_index_data(
+    page: Page,
+    text_limit: int,
+    max_nodes: int,
+    depth: int,
+) -> dict:
+    payload = {
+        "textLimit": text_limit,
+        "maxNodes": max_nodes,
+        "depth": depth,
+    }
+    return await page.evaluate(
+        """(params) => {
+        const textLimit = params.textLimit || 80;
+        const maxNodes = params.maxNodes || 200;
+        const depth = params.depth || 1;
+        const escapeCss = (value) => value.replace(/([ !"#$%&'()*+,.\\/\\\\:;<=>?@\\[\\]^`{|}~])/g, "\\\\$1");
+        const textOf = (el) => {
+            if (!el) return "";
+            const text = el.innerText || el.textContent || "";
+            return text.replace(/\\s+/g, " ").trim();
+        };
+        const clip = (text) => {
+            if (!text) return "";
+            return text.length > textLimit ? text.slice(0, textLimit) + "…" : text;
+        };
+        const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            if (!style || style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        };
+        const cssPath = (el) => {
+            if (!el || el.nodeType !== 1) return "";
+            if (el.id) return "#" + escapeCss(el.id);
+            const parts = [];
+            let current = el;
+            while (current && current.nodeType === 1 && current !== document.documentElement) {
+                const tag = current.tagName.toLowerCase();
+                const parent = current.parentElement;
+                if (!parent) break;
+                const siblings = Array.from(parent.children).filter((child) => child.tagName === current.tagName);
+                const index = siblings.indexOf(current) + 1;
+                parts.unshift(`${tag}:nth-of-type(${index})`);
+                current = parent;
+            }
+            parts.unshift("html");
+            return parts.join(" > ");
+        };
+        const summaryFromHeading = (heading) => {
+            const baseLevel = parseInt(heading.tagName.slice(1), 10);
+            let node = heading.nextElementSibling;
+            while (node) {
+                if (/^H[1-6]$/.test(node.tagName)) {
+                    const level = parseInt(node.tagName.slice(1), 10);
+                    if (level <= baseLevel) break;
+                }
+                const text = textOf(node);
+                if (text) return text;
+                node = node.nextElementSibling;
+            }
+            return "";
+        };
+        const candidates = [
+            document.querySelector("main, article, [role='main'], [role='article']"),
+            document.querySelector("#content, #main, #page, #app, #root"),
+            document.body,
+            document.documentElement
+        ].filter(Boolean);
+        const pickRoot = () => {
+            for (const el of candidates) {
+                const text = textOf(el);
+                if (text.length > 200) return el;
+            }
+            return candidates[0] || document.body || document.documentElement;
+        };
+        const root = pickRoot();
+        const headingMax = Math.min(6, Math.max(1, depth + 1));
+        let headings = Array.from(root.querySelectorAll("h1,h2,h3,h4,h5,h6"))
+            .filter((el) => isVisible(el))
+            .map((el) => {
+                const level = parseInt(el.tagName.slice(1), 10);
+                return {
+                    title: clip(textOf(el)),
+                    level,
+                    summary: clip(summaryFromHeading(el)),
+                    selector: cssPath(el),
+                    anchor: el.id ? "#" + el.id : ""
+                };
+            })
+            .filter((item) => item.title && item.level <= headingMax)
+            .slice(0, maxNodes);
+        if (headings.length === 0) {
+            headings = Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6"))
+                .filter((el) => isVisible(el))
+                .map((el) => {
+                    const level = parseInt(el.tagName.slice(1), 10);
+                    return {
+                        title: clip(textOf(el)),
+                        level,
+                        summary: clip(summaryFromHeading(el)),
+                        selector: cssPath(el),
+                        anchor: el.id ? "#" + el.id : ""
+                    };
+                })
+                .filter((item) => item.title && item.level <= headingMax)
+                .slice(0, maxNodes);
+        }
+        if (headings.length === 0 && document.title) {
+            const rootSelector = cssPath(root);
+            headings = [
+                {
+                    title: clip(document.title),
+                    level: 1,
+                    summary: "",
+                    selector: rootSelector,
+                    anchor: ""
+                }
+            ];
+        }
+        const overlayCandidates = Array.from(document.querySelectorAll("[role='dialog'],[role='alertdialog'],[aria-modal='true']"))
+            .filter((el) => isVisible(el))
+            .map((el) => ({
+                label: clip(el.getAttribute("aria-label") || textOf(el)),
+                selector: cssPath(el)
+            }))
+            .slice(0, Math.max(5, Math.floor(maxNodes / 4)));
+        const controlCandidates = Array.from(document.querySelectorAll("input, textarea, select, button, a"))
+            .filter((el) => isVisible(el))
+            .map((el) => {
+                const tag = el.tagName.toLowerCase();
+                const type = tag === "input" ? (el.getAttribute("type") || "text") : tag;
+                const label = clip(el.getAttribute("aria-label") || el.getAttribute("placeholder") || textOf(el) || el.getAttribute("name") || "");
+                return {
+                    kind: type,
+                    label,
+                    selector: cssPath(el)
+                };
+            })
+            .filter((item) => item.label)
+            .slice(0, Math.max(10, Math.floor(maxNodes / 2)));
+        const collectBlocks = (scope, minLen, minScore) => Array.from(scope.querySelectorAll("p, li, section, article, div"))
+            .filter((el) => isVisible(el))
+            .map((el) => {
+                const text = textOf(el);
+                const textLen = text.length;
+                if (textLen < minLen) return null;
+                const linkText = Array.from(el.querySelectorAll("a")).map((a) => textOf(a)).join(" ");
+                const linkLen = linkText.length;
+                const score = textLen - linkLen * 1.5;
+                return {
+                    text: clip(text),
+                    score,
+                    selector: cssPath(el)
+                };
+            })
+            .filter((item) => item && item.score > minScore);
+        let blockCandidates = collectBlocks(root, 80, 60)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, maxNodes);
+        if (blockCandidates.length === 0) {
+            blockCandidates = collectBlocks(document.body || document.documentElement, 40, 20)
+                .sort((a, b) => b.score - a.score)
+                .slice(0, maxNodes);
+        }
+        return {
+            title: document.title || "",
+            lang: document.documentElement ? (document.documentElement.lang || "") : "",
+            sections: headings,
+            blocks: blockCandidates,
+            interactions: controlCandidates,
+            overlays: overlayCandidates
+        };
+        }""",
+        payload,
+    )
+
+
+def _collect_multiview_items(
+    data: dict,
+    depth: int,
+    text_limit: int,
+    max_nodes: int,
+    path: Optional[str] = None,
+) -> tuple[list[dict], dict[str, str]]:
+    items: list[dict] = []
+    view_paths: dict[str, str] = {}
+    sections = data.get("sections") or []
+    blocks = data.get("blocks") or []
+    interactions = data.get("interactions") or []
+    overlays = data.get("overlays") or []
+    max_level = min(6, max(1, depth + 1))
+    section_indices = list(range(len(sections)))
+    block_indices = list(range(len(blocks)))
+    interaction_indices = list(range(len(interactions)))
+    overlay_indices = list(range(len(overlays)))
+    if path and path.startswith("v:structure/"):
+        match = re.fullmatch(r"v:structure/s(\d+)", path)
+        if match:
+            start = int(match.group(1))
+            if 0 <= start < len(sections):
+                base_level = sections[start].get("level", 1)
+                indices = [start]
+                for idx in range(start + 1, len(sections)):
+                    level = sections[idx].get("level", 1)
+                    if level <= base_level:
+                        break
+                    indices.append(idx)
+                section_indices = indices
+    if path and path.startswith("v:content/"):
+        match = re.fullmatch(r"v:content/b(\d+)", path)
+        if match:
+            start = int(match.group(1))
+            block_indices = [start] if 0 <= start < len(blocks) else []
+    if path and path.startswith("v:interact/"):
+        match = re.fullmatch(r"v:interact/i(\d+)", path)
+        if match:
+            start = int(match.group(1))
+            interaction_indices = [start] if 0 <= start < len(interactions) else []
+    if path and path.startswith("v:overlay/"):
+        match = re.fullmatch(r"v:overlay/o(\d+)", path)
+        if match:
+            start = int(match.group(1))
+            overlay_indices = [start] if 0 <= start < len(overlays) else []
+    for idx in section_indices:
+        if idx >= len(sections):
+            continue
+        section = sections[idx]
+        level = int(section.get("level") or 1)
+        if level > max_level:
+            continue
+        title = _truncate_text(section.get("title") or "", text_limit)
+        if not title:
+            continue
+        summary = _truncate_text(section.get("summary") or "", text_limit)
+        anchor = section.get("anchor") or ""
+        selector = section.get("selector") or ""
+        path_id = f"v:structure/s{idx}"
+        if selector:
+            view_paths[path_id] = selector
+        haystack = " ".join(part for part in [title, summary, anchor] if part)
+        items.append(
+            {
+                "view": "structure",
+                "path": path_id,
+                "label": f'heading "{title}"',
+                "summary": summary,
+                "level": level,
+                "haystack": haystack,
+            }
+        )
+    for idx in block_indices[:max_nodes]:
+        if idx >= len(blocks):
+            continue
+        block = blocks[idx]
+        text_value = _truncate_text(block.get("text") or "", text_limit)
+        if not text_value:
+            continue
+        selector = block.get("selector") or ""
+        path_id = f"v:content/b{idx}"
+        if selector:
+            view_paths[path_id] = selector
+        items.append(
+            {
+                "view": "content",
+                "path": path_id,
+                "label": f'block "{text_value}"',
+                "summary": "",
+                "level": 0,
+                "haystack": text_value,
+            }
+        )
+    for idx in interaction_indices[:max_nodes]:
+        if idx >= len(interactions):
+            continue
+        control = interactions[idx]
+        label = _truncate_text(control.get("label") or "", text_limit)
+        if not label:
+            continue
+        selector = control.get("selector") or ""
+        kind = control.get("kind") or "control"
+        path_id = f"v:interact/i{idx}"
+        if selector:
+            view_paths[path_id] = selector
+        items.append(
+            {
+                "view": "interact",
+                "path": path_id,
+                "label": f'{kind} "{label}"',
+                "summary": "",
+                "level": 0,
+                "haystack": " ".join([kind, label]),
+            }
+        )
+    for idx in overlay_indices[:max_nodes]:
+        if idx >= len(overlays):
+            continue
+        overlay = overlays[idx]
+        label = _truncate_text(overlay.get("label") or "", text_limit)
+        if not label:
+            continue
+        selector = overlay.get("selector") or ""
+        path_id = f"v:overlay/o{idx}"
+        if selector:
+            view_paths[path_id] = selector
+        items.append(
+            {
+                "view": "overlay",
+                "path": path_id,
+                "label": f'dialog "{label}"',
+                "summary": "",
+                "level": 0,
+                "haystack": label,
+            }
+        )
+    return items, view_paths
+
+
+def build_multiview_index_text(
+    data: dict,
+    path: Optional[str],
+    depth: int,
+    max_nodes: int,
+    text_limit: int,
+) -> tuple[str, dict[str, str]]:
+    items, view_paths = _collect_multiview_items(
+        data,
+        depth=depth,
+        text_limit=text_limit,
+        max_nodes=max_nodes,
+        path=path,
+    )
+    if not items:
+        return "(empty)", view_paths
+    lines: list[str] = []
+    views = ["structure", "content", "interact", "overlay"]
+    for view in views:
+        view_items = [item for item in items if item["view"] == view]
+        if not view_items:
+            continue
+        lines.append(f"index (view={view}, path={path or 'root'}, depth={depth}, max_nodes={max_nodes})")
+        if view == "structure":
+            min_level = min(item["level"] for item in view_items if item["level"] > 0) if view_items else 1
+            for item in view_items:
+                indent = "  " * max(0, item["level"] - min_level)
+                line = f'{indent}- {item["label"]} [path={item["path"]}]'
+                if item["summary"]:
+                    line += f' :: {item["summary"]}'
+                lines.append(line)
+        else:
+            for item in view_items:
+                lines.append(f'- {item["label"]} [path={item["path"]}]')
+        lines.append("")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines), view_paths
+
+
+def search_multiview_index_text(
+    data: dict,
+    query: str,
+    mode: str,
+    limit: int,
+    text_limit: int,
+) -> str:
+    if not data or not query:
+        return "(empty)"
+    items, _ = _collect_multiview_items(
+        data,
+        depth=6,
+        text_limit=text_limit,
+        max_nodes=limit,
+        path=None,
+    )
+    results: list[dict] = []
+    if mode == "regex":
+        try:
+            pattern = re.compile(query, re.I)
+        except re.error as error:
+            raise ValueError(f"无效正则: {error}") from error
+        def is_match(text: str) -> bool:
+            return bool(pattern.search(text))
+    else:
+        needle = query.lower()
+        def is_match(text: str) -> bool:
+            return needle in text.lower()
+    for item in items:
+        haystack = item.get("haystack") or ""
+        if not haystack:
+            continue
+        if not is_match(haystack):
+            continue
+        snippet = _match_snippet(haystack, query, mode, text_limit)
+        label = item["label"]
+        if snippet and snippet not in label:
+            label = f'{label} :: {snippet}'
+        results.append(
+            {
+                "path": item["path"],
+                "line": f'- {label} [path={item["path"]}]',
+            }
+        )
+        if len(results) >= limit * 4:
+            break
+    results.sort(key=lambda item: item["path"])
+    pruned: list[str] = []
+    seen: set[str] = set()
+    for item in results:
+        path = item["path"]
+        if path in seen:
+            continue
+        seen.add(path)
+        pruned.append(item["line"])
+        if len(pruned) >= limit:
+            break
+    header = f'search (query="{query}", mode={mode}, limit={limit})'
+    return "\n".join([header, *pruned]) if pruned else f"{header}\n(empty)"
+
+
 def _parse_aria_snapshot(aria_tree: str) -> tuple[list[dict], list[int], dict[str, int]]:
     lines = aria_tree.splitlines()
     element_pattern = re.compile(r'^(\s*-\s*)(\w+)(?:\s+"([^"]*)")?(.*)$')
@@ -331,7 +781,7 @@ def search_snapshot_index_text(
     if not aria_tree or not query:
         return "(empty)"
     nodes, _, _ = _parse_aria_snapshot(aria_tree)
-    results: list[str] = []
+    results: list[dict] = []
     if mode == "regex":
         try:
             pattern = re.compile(query, re.I)
@@ -352,15 +802,32 @@ def search_snapshot_index_text(
             continue
         if not is_match(haystack):
             continue
-        text_hint = _truncate_text(text_value or suffix, text_limit)
+        snippet_source = text_value or suffix or haystack
+        text_hint = _match_snippet(snippet_source, query, mode, text_limit)
         label = node["role"]
         if text_hint:
             label += f' "{text_hint}"'
-        results.append(f"- {label} [path={node['path']}]")
-        if len(results) >= limit:
+        results.append(
+            {
+                "path": node["path"],
+                "line": f"- {label} [path={node['path']}]",
+            }
+        )
+        if len(results) >= limit * 4:
+            break
+    results.sort(key=lambda item: (item["path"].count("/"), item["path"]))
+    pruned: list[str] = []
+    kept_paths: list[str] = []
+    for item in results:
+        path = item["path"]
+        if any(path == kept or path.startswith(f"{kept}/") for kept in kept_paths):
+            continue
+        kept_paths.append(path)
+        pruned.append(item["line"])
+        if len(pruned) >= limit:
             break
     header = f'search (query="{query}", mode={mode}, limit={limit})'
-    return "\n".join([header, *results]) if results else f"{header}\n(empty)"
+    return "\n".join([header, *pruned]) if pruned else f"{header}\n(empty)"
 
 
 def resolve_path_locator(page: Page, aria_tree: str, path: str):
@@ -383,41 +850,44 @@ def resolve_path_locator(page: Page, aria_tree: str, path: str):
     node = nodes[path_to_id[path]]
     role = node["role"]
     name = node["name"]
-    if not name:
-        if role == "text":
-            parent_id = node["parent_id"]
-            while parent_id is not None:
-                parent = nodes[parent_id]
-                if parent["name"] or parent["role"] != "text":
-                    node = parent
-                    role = node["role"]
-                    name = node["name"]
-                    break
-                parent_id = parent["parent_id"]
-            if role == "text" and not name:
-                raise KeyError(f"path 指向 text 节点且无可定位名称: {path}")
-        if name:
+    text_value = _node_text_value(node)
+    if role == "text":
+        if text_value:
             nth_index = 0
             for candidate in nodes:
-                if candidate["role"] == role and candidate["name"] == name:
+                if candidate["role"] == "text" and _node_text_value(candidate) == text_value:
                     if candidate["id"] == node["id"]:
                         break
                     nth_index += 1
-            return page.get_by_role(role, name=name, exact=True).nth(nth_index)
+            return page.get_by_text(text_value, exact=True).nth(nth_index)
+        parent_id = node["parent_id"]
+        while parent_id is not None:
+            parent = nodes[parent_id]
+            if parent["name"] or parent["role"] != "text":
+                node = parent
+                role = node["role"]
+                name = node["name"]
+                break
+            parent_id = parent["parent_id"]
+        if role == "text" and not name:
+            raise KeyError(f"path 指向 text 节点且无可定位名称: {path}")
+    if name:
         nth_index = 0
         for candidate in nodes:
-            if candidate["role"] == role:
+            if candidate["role"] == role and candidate["name"] == name:
                 if candidate["id"] == node["id"]:
                     break
                 nth_index += 1
-        return page.get_by_role(role).nth(nth_index)
+        if role == "text":
+            return page.get_by_text(name, exact=True).nth(nth_index)
+        return page.get_by_role(role, name=name, exact=True).nth(nth_index)
     nth_index = 0
     for candidate in nodes:
-        if candidate["role"] == role and candidate["name"] == name:
+        if candidate["role"] == role:
             if candidate["id"] == node["id"]:
                 break
             nth_index += 1
-    return page.get_by_role(role, name=name, exact=True).nth(nth_index)
+    return page.get_by_role(role).nth(nth_index)
 
 
 def _build_snapshot_from_aria_tree(aria_tree: str, options: SnapshotOptions) -> EnhancedSnapshot:
