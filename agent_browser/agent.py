@@ -421,7 +421,7 @@ console.log("Stealth script finished");
 
 COOKIE_BANNER_JS = """
 (() => {
-    const selectors = [
+    const exactSelectors = [
         "#onetrust-accept-btn-handler",
         "#onetrust-reject-all-handler",
         "#onetrust-pc-btn-handler",
@@ -435,7 +435,9 @@ COOKIE_BANNER_JS = """
         "#CybotCookiebotDialogBodyLevelButtonReject",
         "#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll",
         "#truste-consent-button",
-        ".truste-consent-button",
+        ".truste-consent-button"
+    ];
+    const genericSelectors = [
         "button[aria-label*='close']",
         "button[aria-label*='dismiss']",
         "button[aria-label*='accept']",
@@ -454,6 +456,18 @@ COOKIE_BANNER_JS = """
         ".cc-btn",
         ".cookie-banner button",
         ".cookie-consent button"
+    ];
+    const cookieContainerSelectors = [
+        "[id*='cookie']",
+        "[class*='cookie']",
+        "[id*='consent']",
+        "[class*='consent']",
+        "[id*='privacy']",
+        "[class*='privacy']",
+        "[data-testid*='cookie']",
+        "[data-testid*='consent']",
+        "[aria-label*='cookie']",
+        "[aria-label*='consent']"
     ];
     const textMatchers = [
         /accept all/i,
@@ -525,10 +539,27 @@ COOKIE_BANNER_JS = """
         const rect = el.getBoundingClientRect();
         return rect.width > 0 && rect.height > 0;
     };
-    const clickIfMatch = (el) => {
+    const isClickableElement = (el) => {
+        if (!el || !(el instanceof Element)) return false;
+        const tag = el.tagName ? el.tagName.toLowerCase() : "";
+        if (tag === "button") return true;
+        if (tag === "input") {
+            const type = (el.getAttribute("type") || "").toLowerCase();
+            return type === "button" || type === "submit";
+        }
+        if (el.getAttribute("role") === "button") return true;
+        return false;
+    };
+    const isCookieContext = (el) => {
+        if (!el || !(el instanceof Element)) return false;
+        return Boolean(el.closest(cookieContainerSelectors.join(",")));
+    };
+    const clickIfMatch = (el, requireCookieContext = true) => {
         if (!el || !(el instanceof Element)) return false;
         if (el.disabled) return false;
         if (!isVisible(el)) return false;
+        if (!isClickableElement(el)) return false;
+        if (requireCookieContext && !isCookieContext(el)) return false;
         const text = (el.innerText || el.textContent || "").trim();
         if (!text) return false;
         if (textMatchers.some((matcher) => matcher.test(text))) {
@@ -541,24 +572,39 @@ COOKIE_BANNER_JS = """
     const findAndClick = () => {
         if (handled) return true;
         let clicked = false;
-        for (const sel of selectors) {
+        for (const sel of exactSelectors) {
             const nodes = document.querySelectorAll(sel);
             for (const node of nodes) {
-                if (clickIfMatch(node)) {
+                if (clickIfMatch(node, false)) {
                     clicked = true;
                     break;
                 }
             }
             if (clicked) return true;
         }
-        const candidates = document.querySelectorAll(
-            "button, [role='button'], input[type='button'], input[type='submit'], a"
-        );
-        for (const node of candidates) {
-            if (clickIfMatch(node)) {
-                clicked = true;
-                break;
+        for (const sel of genericSelectors) {
+            const nodes = document.querySelectorAll(sel);
+            for (const node of nodes) {
+                if (clickIfMatch(node, true)) {
+                    clicked = true;
+                    break;
+                }
             }
+            if (clicked) return true;
+        }
+        const containerSelector = cookieContainerSelectors.join(",");
+        const containers = containerSelector ? document.querySelectorAll(containerSelector) : [];
+        for (const container of containers) {
+            const candidates = container.querySelectorAll(
+                "button, [role='button'], input[type='button'], input[type='submit']"
+            );
+            for (const node of candidates) {
+                if (clickIfMatch(node, true)) {
+                    clicked = true;
+                    break;
+                }
+            }
+            if (clicked) break;
         }
         if (clicked) {
             handled = true;
@@ -866,7 +912,7 @@ class AgentBrowser:
         await page.goto(url, wait_until="domcontentloaded", timeout=self._open_timeout_ms)
         if self._stealth_js:
             await self._evaluate_script(page, self._stealth_js)
-        # await self._evaluate_script(page, COOKIE_BANNER_JS)
+        await self._evaluate_script(page, COOKIE_BANNER_JS)
         # await self._handle_cookie_banner(page)
         # await self._evaluate_script(page, POPUP_GUARD_JS)
         # await self._handle_popups(page)
