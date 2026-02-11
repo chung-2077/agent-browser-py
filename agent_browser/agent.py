@@ -2,8 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import re
+import shutil
+import tempfile
+import os
+import random
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
+
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    cv2 = None
+    np = None
 
 from patchright.async_api import Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 
@@ -469,7 +482,7 @@ COOKIE_BANNER_JS = """
         "[aria-label*='cookie']",
         "[aria-label*='consent']"
     ];
-    const textMatchers = [
+    const acceptMatchers = [
         /accept all/i,
         /accept/i,
         /agree/i,
@@ -493,41 +506,68 @@ COOKIE_BANNER_JS = """
         /只保留必要/,
         /仅必要/,
         /仅使用必要/,
-        /拒绝全部/,
-        /全部拒绝/,
-        /拒绝/,
         /accepter tout/i,
         /accepter/i,
         /tout accepter/i,
-        /tout refuser/i,
-        /refuser/i,
         /param[eè]tres/i,
         /personnaliser/i,
         /aceptar todo/i,
         /aceptar/i,
-        /rechazar todo/i,
-        /rechazar/i,
         /configurar/i,
         /preferencias/i,
         /accetta tutto/i,
         /accetta/i,
-        /rifiuta tutto/i,
-        /rifiuta/i,
         /impostazioni/i,
         /aceitar tudo/i,
         /aceitar/i,
-        /rejeitar tudo/i,
-        /rejeitar/i,
         /alles akzeptieren/i,
         /akzeptieren/i,
-        /alles ablehnen/i,
-        /ablehnen/i,
         /einstellungen/i,
         /alles accepteren/i,
         /accepteren/i,
-        /alles weigeren/i,
-        /weigeren/i,
         /instellingen/i
+    ];
+    const rejectMatchers = [
+        /reject all/i,
+        /reject/i,
+        /refuse all/i,
+        /refuse/i,
+        /decline/i,
+        /do not accept/i,
+        /no thanks/i,
+        /拒绝全部/,
+        /全部拒绝/,
+        /拒绝/,
+        /tout refuser/i,
+        /refuser/i,
+        /rechazar todo/i,
+        /rechazar/i,
+        /rifiuta tutto/i,
+        /rifiuta/i,
+        /rejeitar tudo/i,
+        /rejeitar/i,
+        /alles ablehnen/i,
+        /ablehnen/i,
+        /alles weigeren/i,
+        /weigeren/i
+    ];
+    const ignoreMatchers = [
+        /manage/i,
+        /preference/i,
+        /settings?/i,
+        /policy/i,
+        /customi[sz]e/i,
+        /options?/i,
+        /learn more/i,
+        /more info/i,
+        /manage cookies/i,
+        /cookie policy/i,
+        /cookies policy/i,
+        /管理/,
+        /设置/,
+        /偏好/,
+        /政策/,
+        /更多/
     ];
     const isVisible = (el) => {
         if (!el) return false;
@@ -554,7 +594,30 @@ COOKIE_BANNER_JS = """
         if (!el || !(el instanceof Element)) return false;
         return Boolean(el.closest(cookieContainerSelectors.join(",")));
     };
-    const clickIfMatch = (el, requireCookieContext = true) => {
+    const describeElement = (el) => {
+        if (!el || !(el instanceof Element)) return "";
+        const tag = (el.tagName || "").toLowerCase();
+        const id = el.id ? `#${el.id}` : "";
+        const classes = el.className && typeof el.className === "string"
+            ? el.className
+                  .trim()
+                  .split(/\\s+/)
+                  .filter(Boolean)
+                  .map((name) => `.${name}`)
+                  .join("")
+            : "";
+        const text = (el.innerText || el.textContent || "").trim().replace(/\\s+/g, " ");
+        return `${tag}${id}${classes} ${text}`.trim();
+    };
+    const logClick = (kind, el) => {
+        const desc = describeElement(el);
+        if (!desc) {
+            console.info(`[cookie] clicked ${kind}`);
+            return;
+        }
+        console.info(`[cookie] clicked ${kind}: ${desc}`);
+    };
+    const clickIfMatch = (el, matchers, requireCookieContext = true, kind = "button") => {
         if (!el || !(el instanceof Element)) return false;
         if (el.disabled) return false;
         if (!isVisible(el)) return false;
@@ -562,11 +625,19 @@ COOKIE_BANNER_JS = """
         if (requireCookieContext && !isCookieContext(el)) return false;
         const text = (el.innerText || el.textContent || "").trim();
         if (!text) return false;
-        if (textMatchers.some((matcher) => matcher.test(text))) {
+        if (ignoreMatchers.some((matcher) => matcher.test(text))) return false;
+        if (matchers.some((matcher) => matcher.test(text))) {
             el.click();
+            logClick(kind, el);
             return true;
         }
         return false;
+    };
+    const clickPreferAccept = (el, requireCookieContext = true) => {
+        if (clickIfMatch(el, acceptMatchers, requireCookieContext, "accept")) {
+            return true;
+        }
+        return clickIfMatch(el, rejectMatchers, requireCookieContext, "reject");
     };
     let handled = false;
     const findAndClick = () => {
@@ -575,7 +646,7 @@ COOKIE_BANNER_JS = """
         for (const sel of exactSelectors) {
             const nodes = document.querySelectorAll(sel);
             for (const node of nodes) {
-                if (clickIfMatch(node, false)) {
+                if (clickPreferAccept(node, false)) {
                     clicked = true;
                     break;
                 }
@@ -585,7 +656,14 @@ COOKIE_BANNER_JS = """
         for (const sel of genericSelectors) {
             const nodes = document.querySelectorAll(sel);
             for (const node of nodes) {
-                if (clickIfMatch(node, true)) {
+                if (clickIfMatch(node, acceptMatchers, true, "accept")) {
+                    clicked = true;
+                    break;
+                }
+            }
+            if (clicked) return true;
+            for (const node of nodes) {
+                if (clickIfMatch(node, rejectMatchers, true, "reject")) {
                     clicked = true;
                     break;
                 }
@@ -599,7 +677,14 @@ COOKIE_BANNER_JS = """
                 "button, [role='button'], input[type='button'], input[type='submit']"
             );
             for (const node of candidates) {
-                if (clickIfMatch(node, true)) {
+                if (clickIfMatch(node, acceptMatchers, true, "accept")) {
+                    clicked = true;
+                    break;
+                }
+            }
+            if (clicked) break;
+            for (const node of candidates) {
+                if (clickIfMatch(node, rejectMatchers, true, "reject")) {
                     clicked = true;
                     break;
                 }
@@ -796,13 +881,16 @@ class AgentBrowser:
     def __init__(
         self,
         headless: bool = True,
-        viewport: tuple[int, int] = (1280, 720),
+        viewport: tuple[int, int] = (1282, 1783),
         user_agent: Optional[str] = None,
         timeout_ms: int = 10000,
         open_timeout_ms: int = 15000,
         locale: Optional[str] = None,
         timezone: Optional[str] = None,
         use_system_chrome: bool = False,
+        executable_path: Optional[str] = None,
+        profile_dir: Optional[str] = None,
+        use_temp_profile: bool = False,
         cookie_policy: str = "accept_all",
         stealth_js: Optional[str] = None,
     ) -> None:
@@ -818,6 +906,9 @@ class AgentBrowser:
             locale: Browser context locale.
             timezone: Browser context timezone id.
             use_system_chrome: Whether to launch system Chrome instead of bundled Chromium.
+            executable_path: Custom Chrome/Chromium executable path.
+            profile_dir: User data directory for browser profile.
+            use_temp_profile: Whether to create a temporary profile dir when none is provided.
 
         Returns:
             None
@@ -830,6 +921,10 @@ class AgentBrowser:
         self._locale = locale
         self._timezone = timezone
         self._use_system_chrome = use_system_chrome
+        self._executable_path = executable_path
+        self._profile_dir = profile_dir
+        self._use_temp_profile = use_temp_profile
+        self._temp_profile_dir: Optional[str] = None
         self._cookie_policy = cookie_policy
         self._stealth_js = stealth_js
         self._playwright = None
@@ -863,6 +958,14 @@ class AgentBrowser:
             "--no-first-run",
             "--no-zygote",
         ]
+        profile_dir = None
+        if self._profile_dir:
+            profile_dir = str(Path(self._profile_dir).expanduser())
+        elif self._use_temp_profile:
+            self._temp_profile_dir = tempfile.mkdtemp(prefix="agent-browser-profile-")
+            profile_dir = self._temp_profile_dir
+        if profile_dir:
+            args.append(f"--user-data-dir={profile_dir}")
         if self._headless:
             args.extend(["--ignore-gpu-blocklist"])
 
@@ -871,28 +974,24 @@ class AgentBrowser:
         }
         if args:
             launch_kwargs["args"] = args
-        if self._use_system_chrome:
+        if self._executable_path:
+            launch_kwargs["executable_path"] = self._executable_path
+        elif self._use_system_chrome:
             launch_kwargs["channel"] = "chrome"
         self._browser = await self._playwright.chromium.launch(**launch_kwargs)
         
         # 如果未指定 user_agent，则使用去除 Headless 标记的默认 UA
         if not self._user_agent:
-            # 简单策略：先获取当前的默认 UA，然后替换
-            # 但这里我们无法直接获取（需要 page），所以我们硬编码一个现代 Chrome Mac UA
-            # 或者，我们可以启动一个临时页面获取它，但那样太慢。
-            # 最佳实践：硬编码一个较新的稳定版 UA。
-            self._user_agent = (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/121.0.0.0 Safari/537.36"
-            )
+            self._user_agent = await self._resolve_default_user_agent()
 
-        self._context = await self._browser.new_context(
-            viewport={"width": self._viewport[0], "height": self._viewport[1]},
-            user_agent=self._user_agent,
-            locale=self._locale,
-            timezone_id=self._timezone,
-        )
+        context_kwargs: Dict[str, Any] = {
+            "viewport": {"width": self._viewport[0], "height": self._viewport[1]},
+            "locale": self._locale,
+            "timezone_id": self._timezone,
+        }
+        if self._user_agent:
+            context_kwargs["user_agent"] = self._user_agent
+        self._context = await self._browser.new_context(**context_kwargs)
 
     async def open(self, url: str) -> str:
         """
@@ -938,6 +1037,19 @@ class AgentBrowser:
                 raise
         if last_error is not None:
             raise last_error
+
+    async def _resolve_default_user_agent(self) -> Optional[str]:
+        if not self._browser:
+            return None
+        context = await self._browser.new_context()
+        try:
+            page = await context.new_page()
+            user_agent = await page.evaluate("() => navigator.userAgent")
+        finally:
+            await context.close()
+        if not user_agent:
+            return None
+        return user_agent.replace("HeadlessChrome", "Chrome")
 
     async def _maybe_has_cookie_banner(self, page: Page, selectors: list[str]) -> bool:
         selector_union = ",".join(selectors)
@@ -1423,6 +1535,9 @@ class AgentBrowser:
         if self._playwright:
             await self._playwright.stop()
             self._playwright = None
+        if self._temp_profile_dir:
+            shutil.rmtree(self._temp_profile_dir, ignore_errors=True)
+            self._temp_profile_dir = None
 
     def _get_state(self, page_id: str) -> PageState:
         if page_id not in self._pages:
@@ -2631,3 +2746,203 @@ class AgentBrowser:
         """
         state = self._get_state(page_id)
         return await state.page.title()
+
+    async def solve_cloudflare_captcha(self, page_id: str, template_path: Optional[str] = None) -> bool:
+        """
+        Solve Cloudflare Turnstile/Challenge using visual template matching.
+        
+        Args:
+            page_id: The page identifier.
+            template_path: Path to the reference image (e.g., 'assets/cloudflare_template.png').
+                           If not provided, defaults to 'agent_browser/assets/cloudflare_template.png'.
+                           
+        Returns:
+            True if the captcha was found and clicked, False otherwise.
+        """
+        if not self._browser:
+            raise RuntimeError("Browser not started")
+        page_state = self._pages.get(page_id)
+        if not page_state:
+            raise ValueError(f"Page {page_id} not found")
+        page = page_state.page
+        
+        # Determine template path
+        if not template_path:
+            # Default location
+            current_dir = Path(__file__).parent
+            template_path = str(current_dir / "assets" / "cloudflare_template.png")
+            
+        if not os.path.exists(template_path):
+            print(f"Warning: Cloudflare template not found at {template_path}")
+            return False
+            
+        if cv2 is None or np is None:
+            print("Error: opencv-python and numpy are required for visual solver")
+            return False
+            
+        try:
+            # Take screenshot of the visible viewport
+            screenshot_bytes = await page.screenshot(type="png")
+            
+            # Decode screenshot to OpenCV format
+            nparr = np.frombuffer(screenshot_bytes, np.uint8)
+            screenshot = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            # Load template
+            template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+            if template is None:
+                print("Failed to load template image")
+                return False
+                
+            # Convert to grayscale for matching
+            gray_screenshot = cv2.cvtColor(screenshot, cv2.COLOR_BGR2GRAY)
+            gray_template = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+            
+            # Apply Gaussian Blur to "ignore text inconsistencies" (fuzzy matching)
+            # This helps matching general shapes (box + logo) rather than exact text pixels
+            gray_screenshot = cv2.GaussianBlur(gray_screenshot, (5, 5), 0)
+            gray_template = cv2.GaussianBlur(gray_template, (5, 5), 0)
+            
+            # Template matching
+            result = cv2.matchTemplate(gray_screenshot, gray_template, cv2.TM_CCOEFF_NORMED)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+            
+            # Threshold (0.8 is usually good for CCOEFF_NORMED, but with blur we might be safer with 0.7-0.75)
+            threshold = 0.75
+            if max_val >= threshold:
+                print(f"Cloudflare visual match found! Confidence: {max_val:.2f}")
+                
+                # Get device pixel ratio for coordinate conversion
+                device_pixel_ratio = await page.evaluate("window.devicePixelRatio")
+                
+                # Calculate match coordinates (Pixels)
+                h, w = gray_template.shape
+                top_left = max_loc
+                bottom_right = (top_left[0] + w, top_left[1] + h)
+                
+                # Default fallback: heuristic position (approx 0.6 * height from left)
+                center_x_pixel = top_left[0] + int(h * 0.6)
+                center_y_pixel = top_left[1] + h // 2
+                
+                # Debug: Prepare visualization
+                debug_img = screenshot.copy()
+                cv2.rectangle(debug_img, top_left, bottom_right, (0, 0, 255), 2)
+
+                # --- INTELLIGENT CHECKBOX DETECTION ---
+                try:
+                    # Extract ROI from original screenshot (not blurred) to find the checkbox
+                    # Ensure ROI is within bounds
+                    roi_y1 = max(0, top_left[1])
+                    roi_y2 = min(screenshot.shape[0], bottom_right[1])
+                    roi_x1 = max(0, top_left[0])
+                    roi_x2 = min(screenshot.shape[1], bottom_right[0])
+                    
+                    roi = screenshot[roi_y1:roi_y2, roi_x1:roi_x2]
+                    
+                    if roi.size > 0:
+                        # Convert ROI to grayscale
+                        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                        
+                        # Adaptive Thresholding to find the checkbox border
+                        # cv2.ADAPTIVE_THRESH_GAUSSIAN_C works well for varying lighting
+                        roi_thresh = cv2.adaptiveThreshold(roi_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                                        cv2.THRESH_BINARY_INV, 11, 2)
+                        
+                        # Find contours in the ROI
+                        contours, _ = cv2.findContours(roi_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        
+                        best_checkbox = None
+                        min_dist_to_left = float('inf')
+                        
+                        # Filter contours to find the square checkbox on the left
+                        for cnt in contours:
+                            x, y, cw, ch = cv2.boundingRect(cnt)
+                            aspect_ratio = float(cw) / ch if ch > 0 else 0
+                            
+                            # Checkbox criteria:
+                            # 1. Square-ish shape (0.8 - 1.2 aspect ratio)
+                            # 2. Located on the left side of the ROI (x < width * 0.4)
+                            # 3. Reasonable height relative to template height (15% - 80%)
+                            if 0.75 <= aspect_ratio <= 1.25 and x < w * 0.4 and (h * 0.15) < ch < (h * 0.8):
+                                # We want the left-most valid square, but sometimes there's noise.
+                                # Also prefer larger ones (likely the outer box)
+                                if x < min_dist_to_left:
+                                    min_dist_to_left = x
+                                    best_checkbox = (x, y, cw, ch)
+                        
+                        if best_checkbox:
+                            bx, by, bw, bh = best_checkbox
+                            # Found the checkbox! Calculate its center in global coordinates
+                            # Re-calculate center based on detection
+                            center_x_pixel = roi_x1 + bx + bw // 2
+                            center_y_pixel = roi_y1 + by + bh // 2
+                            print(f"Detected checkbox at relative ({bx}, {by}) size {bw}x{bh}")
+                            
+                            # Debug: Draw the detected checkbox in Green
+                            cv2.rectangle(debug_img, (roi_x1 + bx, roi_y1 + by), 
+                                        (roi_x1 + bx + bw, roi_y1 + by + bh), (0, 255, 0), 2)
+                        else:
+                            print("Checkbox contour not found, using heuristic fallback")
+                            # Debug: Draw fallback point in Yellow
+                            cv2.circle(debug_img, (center_x_pixel, center_y_pixel), 5, (0, 255, 255), -1)
+                except Exception as e:
+                    print(f"Error during checkbox detection: {e}")
+                    # Fallback is already set
+                
+                # Convert to Viewport Coordinates (CSS Pixels)
+                center_x = center_x_pixel / device_pixel_ratio
+                center_y = center_y_pixel / device_pixel_ratio
+                
+                print(f"Match Location (Pixels): {top_left}, Center: ({center_x_pixel}, {center_y_pixel})")
+                print(f"Click Coordinates (CSS): ({center_x}, {center_y}), DPR: {device_pixel_ratio}")
+                
+                # Save debug image
+                # timestamp = int(time.time())
+                # debug_filename = f"debug_cf_match_{timestamp}.png"
+                # debug_path = str(Path(self._profile_dir or ".") / debug_filename)
+                # # If using temp profile, save to current working dir instead for easier access
+                # if self._use_temp_profile:
+                #      debug_path = str(Path.cwd() / debug_filename)
+                
+                # cv2.imwrite(debug_path, debug_img)
+                # print(f"Debug image saved to: {debug_path}")
+                
+                # Move mouse and click (human-like)
+                # First move nearby then precise
+                await page.mouse.move(center_x + random.randint(-50, 50), center_y + random.randint(-50, 50), steps=5)
+                await page.mouse.move(center_x, center_y, steps=random.randint(10, 20))
+                
+                # Small random jitter
+                jitter_x = random.randint(-2, 2)
+                jitter_y = random.randint(-2, 2)
+                await page.mouse.move(center_x + jitter_x, center_y + jitter_y, steps=2)
+                
+                await asyncio.sleep(random.uniform(0.1, 0.3))
+                await page.mouse.down()
+                await asyncio.sleep(random.uniform(0.1, 0.2))
+                await page.mouse.up()
+                
+                # Wait for verification (often takes a few seconds)
+                await asyncio.sleep(3)
+                return True
+            else:
+                print(f"Cloudflare template not found. Max confidence: {max_val:.2f}")
+                
+                # Save failed debug image with max match location
+                # debug_img = screenshot.copy()
+                # h, w = gray_template.shape
+                # top_left = max_loc
+                # bottom_right = (top_left[0] + w, top_left[1] + h)
+                # cv2.rectangle(debug_img, top_left, bottom_right, (255, 0, 0), 2)
+                
+                # timestamp = int(time.time())
+                # debug_filename = f"debug_cf_failed_{timestamp}.png"
+                # debug_path = str(Path.cwd() / debug_filename)
+                # cv2.imwrite(debug_path, debug_img)
+                # print(f"Failed match debug image saved to: {debug_path}")
+                
+                return False
+                
+        except Exception as e:
+            print(f"Error in visual cloudflare solver: {e}")
+            return False

@@ -109,6 +109,7 @@ async def cli() -> None:
                             "stream_stop",
                             "close [page_id]",
                             "test_stealth",
+                            "solve_cf [template_path]",
                             "exit|quit",
                         ]
                     )
@@ -116,14 +117,21 @@ async def cli() -> None:
                 continue
 
             try:
-                if command == "test_stealth":
+                if command == "solve_cf":
+                    page_id = await require_page()
+                    template = args[0] if args else None
+                    print("尝试解决 Cloudflare 验证...")
+                    result = await browser.solve_cloudflare_captcha(page_id, template_path=template)
+                    print(f"Cloudflare 解决结果: {result}")
+                elif command == "test_stealth":
                     print(f"开始隐身性测试 (当前模式: {'Headless/无头' if headless else 'Headed/有头'})...")
                     if not headless:
                         print("提示: 想要测试最严格的“防爬检测”，建议使用 `python main.py --headless` 启动。")
                         
                     tasks = [
                         ("https://bot.sannysoft.com/", "stealth_sannysoft.png"),
-                        ("https://arh.antoinevastel.com/bots/", "stealth_antoinevastel.png")
+                        ("https://www.browserscan.net/bot-detection", "browserscan.png"),
+                        ("https://google.com","google.png")
                     ]
                     for url, filename in tasks:
                         print(f"正在访问 {url} ...")
