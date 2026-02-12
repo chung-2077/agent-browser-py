@@ -516,7 +516,7 @@ def search_multiview_index_text(
         data,
         depth=6,
         text_limit=text_limit,
-        max_nodes=limit,
+        max_nodes=max(200, limit * 10),
         path=None,
     )
     results: list[dict] = []

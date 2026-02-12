@@ -868,6 +868,9 @@ class PageState:
     stream_server: Optional[StreamServer] = None
     console_server: Optional[ConsoleStreamServer] = None
     index_paths: Dict[str, str] = field(default_factory=dict)
+    last_aria_tree: Optional[str] = None
+    last_aria_tree_url: Optional[str] = None
+    last_aria_tree_ts: float = 0.0
 
 
 class AgentBrowser:
@@ -1544,6 +1547,20 @@ class AgentBrowser:
             raise KeyError(f"未知的 page_id: {page_id}")
         return self._pages[page_id]
 
+    def _cache_aria_tree(self, state: PageState, aria_tree: str) -> None:
+        state.last_aria_tree = aria_tree
+        state.last_aria_tree_url = state.page.url
+        state.last_aria_tree_ts = time.monotonic()
+
+    def _get_cached_aria_tree(self, state: PageState, max_age: float) -> Optional[str]:
+        if not state.last_aria_tree:
+            return None
+        if state.last_aria_tree_url != state.page.url:
+            return None
+        if time.monotonic() - state.last_aria_tree_ts > max_age:
+            return None
+        return state.last_aria_tree
+
     async def _start_stream_for_page(
         self,
         page_id: str,
@@ -1661,6 +1678,7 @@ class AgentBrowser:
         """
         state = self._get_state(page_id)
         aria_tree = await state.page.locator(":root").aria_snapshot()
+        self._cache_aria_tree(state, aria_tree)
         view_path = self._normalize_path(path) if path else None
         multiview_data = await get_multiview_index_data(
             state.page,
@@ -1712,17 +1730,19 @@ class AgentBrowser:
         """
         state = self._get_state(page_id)
         aria_tree = await state.page.locator(":root").aria_snapshot()
+        self._cache_aria_tree(state, aria_tree)
+        multiview_max_nodes = max(200, limit * 10)
         multiview_data = await get_multiview_index_data(
             state.page,
             text_limit=text_limit,
-            max_nodes=limit,
+            max_nodes=multiview_max_nodes,
             depth=6,
         )
         _, view_paths = build_multiview_index_text(
             multiview_data,
             path=None,
             depth=6,
-            max_nodes=limit,
+            max_nodes=multiview_max_nodes,
             text_limit=text_limit,
         )
         state.index_paths = view_paths
@@ -1773,7 +1793,12 @@ class AgentBrowser:
         state = self._get_state(page_id)
         options = SnapshotOptions()
         snapshot_timeout_ms = min(10000, self._timeout_ms)
-        async def build_tree(locator, label: Optional[str] = None, update_refs: bool = False) -> str:
+        async def build_tree(
+            locator,
+            label: Optional[str] = None,
+            update_refs: bool = False,
+            target_path: Optional[str] = None,
+        ) -> str:
             try:
                 snapshot = await get_enhanced_snapshot_locator(
                     locator,
@@ -1781,6 +1806,17 @@ class AgentBrowser:
                     timeout_ms=snapshot_timeout_ms,
                 )
             except PlaywrightTimeoutError:
+                if target_path and not target_path.startswith("v:"):
+                    cached = self._get_cached_aria_tree(state, max_age=3.0)
+                    if cached:
+                        tree = build_snapshot_index_text(
+                            cached,
+                            path=target_path,
+                            depth=2,
+                            max_nodes=120,
+                            text_limit=120,
+                        )
+                        return f"{label}\n{tree}" if label else tree
                 tree = f"[timeout after {snapshot_timeout_ms}ms]"
                 return f"{label}\n{tree}" if label else tree
             if update_refs:
@@ -1819,14 +1855,14 @@ class AgentBrowser:
                 if target_path in {"0", "root"}:
                     return await build_root(update_refs=True)
                 locator = await self._resolve_path_locator(state, target_path)
-                return await build_tree(locator, update_refs=True)
+                return await build_tree(locator, update_refs=True, target_path=target_path)
             sections: list[str] = []
             for target_path in paths:
                 if target_path in {"0", "root"}:
                     tree = await build_root()
                 else:
                     locator = await self._resolve_path_locator(state, target_path)
-                    tree = await build_tree(locator)
+                    tree = await build_tree(locator, target_path=target_path)
                 sections.append(f"section (path={target_path})\n{tree}")
             return "\n\n".join(sections)
         locator = state.page.locator(selector)
@@ -1893,11 +1929,18 @@ class AgentBrowser:
             if normalized not in state.index_paths:
                 raise KeyError(f"未知的 path: {normalized}")
             return state.page.locator(state.index_paths[normalized])
+        cached = self._get_cached_aria_tree(state, max_age=3.0)
+        if cached:
+            try:
+                return resolve_path_locator(state.page, cached, normalized)
+            except KeyError:
+                pass
         snapshot_timeout_ms = min(10000, self._timeout_ms)
         try:
             aria_tree = await state.page.locator(":root").aria_snapshot(timeout=snapshot_timeout_ms)
         except PlaywrightTimeoutError as error:
             raise ValueError(f"Path snapshot timed out after {snapshot_timeout_ms}ms") from error
+        self._cache_aria_tree(state, aria_tree)
         return resolve_path_locator(state.page, aria_tree, normalized)
 
     async def _get_locator_text(self, locator) -> Optional[str]:
