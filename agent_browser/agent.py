@@ -1013,7 +1013,7 @@ class AgentBrowser:
         Returns:
             None
         """
-        if self._browser:
+        if self._browser or self._context:
             return
         self._playwright = await async_playwright().start()
 
@@ -1032,7 +1032,11 @@ class AgentBrowser:
         elif self._use_temp_profile:
             self._temp_profile_dir = tempfile.mkdtemp(prefix="agent-browser-profile-")
             profile_dir = self._temp_profile_dir
-        if profile_dir:
+        
+        # If a profile directory is specified, use launch_persistent_context to maintain user data (cookies, etc.)
+        use_persistent_context = bool(profile_dir)
+
+        if profile_dir and not use_persistent_context:
             args.append(f"--user-data-dir={profile_dir}")
         if self._headless:
             args.extend(["--ignore-gpu-blocklist"])
@@ -1046,20 +1050,39 @@ class AgentBrowser:
             launch_kwargs["executable_path"] = self._executable_path
         elif self._use_system_chrome:
             launch_kwargs["channel"] = "chrome"
-        self._browser = await self._playwright.chromium.launch(**launch_kwargs)
-        
-        # 如果未指定 user_agent，则使用去除 Headless 标记的默认 UA
-        if not self._user_agent:
-            self._user_agent = await self._resolve_default_user_agent()
 
-        context_kwargs: Dict[str, Any] = {
-            "viewport": {"width": self._viewport[0], "height": self._viewport[1]},
-            "locale": self._locale,
-            "timezone_id": self._timezone,
-        }
-        if self._user_agent:
-            context_kwargs["user_agent"] = self._user_agent
-        self._context = await self._browser.new_context(**context_kwargs)
+        if use_persistent_context:
+            context_kwargs = {
+                "viewport": {"width": self._viewport[0], "height": self._viewport[1]},
+                "locale": self._locale,
+                "timezone_id": self._timezone,
+            }
+            if self._user_agent:
+                context_kwargs["user_agent"] = self._user_agent
+            
+            # Merge context_kwargs into launch_kwargs for persistent context
+            launch_kwargs.update(context_kwargs)
+            
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=profile_dir,
+                **launch_kwargs
+            )
+            self._browser = None
+        else:
+            self._browser = await self._playwright.chromium.launch(**launch_kwargs)
+            
+            # Resolve default user agent if not provided
+            if not self._user_agent:
+                self._user_agent = await self._resolve_default_user_agent()
+
+            context_kwargs: Dict[str, Any] = {
+                "viewport": {"width": self._viewport[0], "height": self._viewport[1]},
+                "locale": self._locale,
+                "timezone_id": self._timezone,
+            }
+            if self._user_agent:
+                context_kwargs["user_agent"] = self._user_agent
+            self._context = await self._browser.new_context(**context_kwargs)
 
     async def open(self, url: str) -> str:
         """
