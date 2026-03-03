@@ -22,7 +22,7 @@ from patchright.async_api import Browser, BrowserContext, Page, TimeoutError as 
 
 from .console import ConsoleRecorder, ConsoleStreamServer
 from .errors import to_ai_friendly_error
-from .snapshot import EnhancedSnapshot, SnapshotOptions, get_enhanced_snapshot, get_enhanced_snapshot_locator, build_snapshot_index_text, resolve_path_locator, search_snapshot_index_text, get_multiview_index_data, build_multiview_index_text, search_multiview_index_text
+from .snapshot import EnhancedSnapshot, SnapshotOptions, get_enhanced_snapshot, get_enhanced_snapshot_locator, build_snapshot_index_text, resolve_path_locator, search_snapshot_index_text, get_multiview_index_data, build_multiview_index_text, search_multiview_index_text, RefTarget
 from .storage import cookies_clear, cookies_get, cookies_set, storage_clear, storage_get, storage_set
 from .streaming import StreamServer
 
@@ -79,7 +79,6 @@ def build_llm_method_tutorial(method_names: Iterable[str]) -> str:
         "snapshot",
         "snapshot_index",
         "snapshot_search",
-        "snapshot_section_snapshot",
         "click",
         "fill",
         "select",
@@ -98,7 +97,6 @@ def build_llm_method_tutorial(method_names: Iterable[str]) -> str:
         "snapshot": "snapshot(page_id, ...): Get a readable snapshot and stable @eN refs.",
         "snapshot_index": "snapshot_index(page_id, ...): Return a hierarchical index with paths.",
         "snapshot_search": "snapshot_search(page_id, query, ...): Search the index text and return matched paths.",
-        "snapshot_section_snapshot": "snapshot_section_snapshot(page_id, path, ...): Get a section snapshot by path or selector.",
         "click": "click(page_id, selector_or_ref): Click an element.",
         "fill": "fill(page_id, selector_or_ref, text): Fill text into an element.",
         "select": "select(page_id, selector_or_ref, value): Select an option value.",
@@ -120,13 +118,12 @@ def build_llm_method_tutorial(method_names: Iterable[str]) -> str:
         lines.append("General: Use snapshot(..., interactive=True) to get @eN, then pass @eN or standard CSS selectors.")
         lines.append("Selector note: AgentBrowser uses Playwright locators; prefer @eN refs.")
     if any(
-        name in {"snapshot_index", "snapshot_search", "snapshot_section_snapshot"}
+        name in {"snapshot_index", "snapshot_search"}
         for name in ordered
     ):
-        lines.append("Index: snapshot_index returns hierarchical paths; long labels are truncated and deep nodes are collapsed.")
-        lines.append("Search: snapshot_search can be called repeatedly to narrow scope and find parent/neighbor paths.")
-        lines.append("Section: snapshot_section_snapshot accepts one or multiple paths and returns actionable text with refs.")
-        lines.append("Flow: index/search to find paths -> section snapshot to view regions -> use @eN actions.")
+        lines.append("Index: snapshot_index returns a summarized view with headings and landmarks.")
+        lines.append("Search: snapshot_search finds text and returns lines with @eN refs.")
+        lines.append("Flow: index/search to find content -> use snapshot(selector='@eN') to view details -> use @eN actions.")
     for name in ordered:
         guide = tutorials.get(name)
         if guide:
@@ -430,6 +427,74 @@ safeStealth("canvas_noise", () => {
 });
 
 console.log("Stealth script finished");
+"""
+
+FREEZE_ANIMATIONS_JS = """
+// =================================================================================
+// Freeze Animations & Timers
+// =================================================================================
+(function() {
+    try {
+        // 1. Force pause animations via CSS
+        const style = document.createElement('style');
+        style.type = 'text/css';
+        style.innerHTML = `
+            * {
+                transition: none !important;
+                animation-play-state: paused !important;
+                scroll-behavior: auto !important;
+            }
+            /* Stop marquees */
+            marquee {
+                animation-play-state: paused !important;
+            }
+        `;
+        if (document.head) {
+            document.head.appendChild(style);
+        } else {
+            document.documentElement.appendChild(style);
+        }
+
+        // 2. Hijack timers to stop auto-rotation
+        // We capture original functions but don't execute them for short intervals
+        // that likely drive animations (e.g. < 1000ms). 
+        // Long timers might be functional (session timeout), so we keep them.
+        const originalSetInterval = window.setInterval;
+        const originalSetTimeout = window.setTimeout;
+
+        window.setInterval = function(callback, delay, ...args) {
+            if (delay && delay < 10000) {
+                // Ignore fast intervals often used for carousels/animations
+                return Math.floor(Math.random() * 10000); 
+            }
+            return originalSetInterval.call(window, callback, delay, ...args);
+        };
+
+        window.setTimeout = function(callback, delay, ...args) {
+            if (delay && delay < 3000) {
+                 // Ignore fast timeouts
+                return Math.floor(Math.random() * 10000);
+            }
+            return originalSetTimeout.call(window, callback, delay, ...args);
+        };
+        
+        // 3. Pause media elements
+        document.addEventListener('DOMContentLoaded', () => {
+            document.querySelectorAll('video, audio').forEach(el => {
+                try { el.pause(); } catch(e) {}
+            });
+        }, { once: true });
+        
+        // Also try immediately
+        document.querySelectorAll('video, audio').forEach(el => {
+            try { el.pause(); } catch(e) {}
+        });
+
+        console.log("Animations and timers frozen.");
+    } catch (e) {
+        console.error("Freeze script error:", e);
+    }
+})();
 """
 
 COOKIE_BANNER_JS = """
@@ -1011,7 +1076,15 @@ class AgentBrowser:
             raise RuntimeError("浏览器上下文未初始化")
         page = await self._context.new_page()
         page.set_default_timeout(self._timeout_ms)
+        
+        # Add freeze script as an init script so it runs before page load
+        # await page.add_init_script(FREEZE_ANIMATIONS_JS)
+        
         await page.goto(url, wait_until="domcontentloaded", timeout=self._open_timeout_ms)
+        
+        # Inject freeze script after page load (since patchright might not support add_init_script)
+        await self._evaluate_script(page, FREEZE_ANIMATIONS_JS)
+        
         if self._stealth_js:
             await self._evaluate_script(page, self._stealth_js)
         await self._evaluate_script(page, COOKIE_BANNER_JS)
@@ -1590,6 +1663,8 @@ class AgentBrowser:
         max_depth: Optional[int] = None,
         compact: bool = False,
         selector: Optional[str] = None,
+        text_limit: Optional[int] = None,
+        summary: bool = False,
     ) -> str:
         """
         Get an accessibility snapshot of the page and generate stable refs.
@@ -1600,6 +1675,8 @@ class AgentBrowser:
             max_depth: Optional maximum tree depth to include.
             compact: If True, filter out purely structural unnamed nodes.
             selector: Optional CSS selector to scope the snapshot.
+            text_limit: Optional max length for node labels.
+            summary: If True, generate a summary with only headings, landmarks, and interactive elements.
 
         Returns:
             An EnhancedSnapshot object with:
@@ -1611,6 +1688,8 @@ class AgentBrowser:
             interactive=interactive,
             max_depth=max_depth,
             compact=compact,
+            text_limit=text_limit,
+            summary=summary,
         )
         snapshot_timeout_ms = min(10000, self._timeout_ms)
         if not selector:
@@ -1624,7 +1703,17 @@ class AgentBrowser:
                 return f"[timeout after {snapshot_timeout_ms}ms]"
             state.refs = snapshot.refs
             return snapshot.tree
-        locator = state.page.locator(selector)
+
+        locator = None
+        if selector.startswith("@"):
+            ref_id = selector[1:]
+            try:
+                locator = self._resolve_ref_locator(state, ref_id)
+            except KeyError:
+                raise ValueError(f"Unknown ref: {selector}")
+        else:
+            locator = state.page.locator(selector)
+
         count = await locator.count()
         if count == 0:
             raise ValueError(f"Selector matched no elements: {selector}")
@@ -1664,48 +1753,29 @@ class AgentBrowser:
         text_limit: int = 180,
     ) -> str:
         """
-        Build a compact hierarchical index of the page.
+        Build a compact hierarchical index of the page using stable refs.
+
+        This returns a summarized view (headings, landmarks, interactive elements)
+        with truncated text, suitable for navigation.
 
         Args:
             page_id: Target page id returned by open().
-            path: Optional index path to expand from. Use "root" or "0" for full page.
-            depth: Depth to expand from the start node.
-            max_nodes: Maximum number of nodes to return.
-            text_limit: Max length for node labels and summaries.
+            path: (Deprecated) Index path.
+            depth: (Deprecated) Depth to expand.
+            max_nodes: (Deprecated) Max nodes.
+            text_limit: Max length for node labels.
 
         Returns:
-            A human-readable index text with paths for navigation.
+            A human-readable index text with stable @ref IDs.
         """
-        state = self._get_state(page_id)
-        aria_tree = await state.page.locator(":root").aria_snapshot()
-        self._cache_aria_tree(state, aria_tree)
-        view_path = self._normalize_path(path) if path else None
-        multiview_data = await get_multiview_index_data(
-            state.page,
-            text_limit=text_limit,
-            max_nodes=max_nodes,
-            depth=depth,
-        )
-        multiview_text, view_paths = build_multiview_index_text(
-            multiview_data,
-            path=view_path if view_path and view_path.startswith("v:") else None,
-            depth=depth,
-            max_nodes=max_nodes,
+        # Use the new summary mode which is more stable and concise
+        return await self.snapshot(
+            page_id=page_id,
+            interactive=False,
+            summary=True,
+            compact=True,
             text_limit=text_limit,
         )
-        state.index_paths = view_paths
-        if view_path and view_path.startswith("v:"):
-            return multiview_text
-        aria_text = build_snapshot_index_text(
-            aria_tree,
-            path=path,
-            depth=depth,
-            max_nodes=max_nodes,
-            text_limit=text_limit,
-        )
-        if multiview_text and multiview_text != "(empty)":
-            return "\n\n".join([multiview_text, aria_text])
-        return aria_text
 
     async def snapshot_search(
         self,
@@ -1716,7 +1786,7 @@ class AgentBrowser:
         text_limit: int = 80,
     ) -> str:
         """
-        Search index nodes by fuzzy text or regex.
+        Search for nodes containing query text.
 
         Args:
             page_id: Target page id returned by open().
@@ -1726,157 +1796,45 @@ class AgentBrowser:
             text_limit: Max length for node labels.
 
         Returns:
-            A human-readable list of matching nodes with their paths.
+            A list of matching nodes with their @ref IDs.
         """
-        state = self._get_state(page_id)
-        aria_tree = await state.page.locator(":root").aria_snapshot()
-        self._cache_aria_tree(state, aria_tree)
-        multiview_max_nodes = max(200, limit * 10)
-        multiview_data = await get_multiview_index_data(
-            state.page,
-            text_limit=text_limit,
-            max_nodes=multiview_max_nodes,
-            depth=6,
+        # Get full snapshot to search everything
+        # We use a larger text_limit to ensure we can find content
+        tree = await self.snapshot(
+            page_id, 
+            interactive=False, 
+            summary=False, 
+            text_limit=500  # Allow more text for searching
         )
-        _, view_paths = build_multiview_index_text(
-            multiview_data,
-            path=None,
-            depth=6,
-            max_nodes=multiview_max_nodes,
-            text_limit=text_limit,
-        )
-        state.index_paths = view_paths
-        multiview_results = search_multiview_index_text(
-            multiview_data,
-            query=query,
-            mode=mode,
-            limit=limit,
-            text_limit=text_limit,
-        )
-        aria_results = search_snapshot_index_text(
-            aria_tree,
-            query=query,
-            mode=mode,
-            limit=limit,
-            text_limit=text_limit,
-        )
-        if multiview_results.endswith("(empty)") and aria_results.endswith("(empty)"):
-            return multiview_results
-        if multiview_results.endswith("(empty)"):
-            return aria_results
-        if aria_results.endswith("(empty)"):
-            return multiview_results
+        
+        lines = tree.splitlines()
+        results = []
+        
+        import re
+        if mode == "regex":
+             try:
+                 pattern = re.compile(query, re.I)
+                 match_func = lambda s: pattern.search(s)
+             except re.error as e:
+                 return f"Invalid regex: {e}"
+        else:
+             needle = query.lower()
+             match_func = lambda s: needle in s.lower()
+             
+        for line in lines:
+            if match_func(line):
+                # If text_limit is requested for output, we might need to truncate again?
+                # But the line is already formatted.
+                # Just return the line.
+                results.append(line.strip())
+                if len(results) >= limit:
+                    break
+        
+        if not results:
+             return "(no matches)"
+             
         header = f'search (query="{query}", mode={mode}, limit={limit})'
-        return "\n".join([header, "view=multiview", *multiview_results.splitlines()[1:], "view=aria", *aria_results.splitlines()[1:]])
-
-    async def snapshot_section_snapshot(
-        self,
-        page_id: str,
-        path: Optional[str] = None,
-        selector: Optional[str] = None,
-    ) -> str:
-        """
-        Get a section snapshot by index path(s) or selector.
-
-        Args:
-            page_id: Target page id returned by open().
-            path: Index path. e.g. ["0/1","0/2"]
-            selector: Optional CSS selector to scope the snapshot.
-            interactive: If True, only include interactive elements.
-            max_depth: Optional maximum tree depth to include.
-            compact: If True, filter out purely structural unnamed nodes.
-
-        Returns:
-            One or more section snapshots as text. Multiple paths are separated
-            by section headers.
-        """
-        state = self._get_state(page_id)
-        options = SnapshotOptions()
-        snapshot_timeout_ms = min(10000, self._timeout_ms)
-        async def build_tree(
-            locator,
-            label: Optional[str] = None,
-            update_refs: bool = False,
-            target_path: Optional[str] = None,
-        ) -> str:
-            try:
-                snapshot = await get_enhanced_snapshot_locator(
-                    locator,
-                    options,
-                    timeout_ms=snapshot_timeout_ms,
-                )
-            except PlaywrightTimeoutError:
-                if target_path and not target_path.startswith("v:"):
-                    cached = self._get_cached_aria_tree(state, max_age=3.0)
-                    if cached:
-                        tree = build_snapshot_index_text(
-                            cached,
-                            path=target_path,
-                            depth=2,
-                            max_nodes=120,
-                            text_limit=120,
-                        )
-                        return f"{label}\n{tree}" if label else tree
-                tree = f"[timeout after {snapshot_timeout_ms}ms]"
-                return f"{label}\n{tree}" if label else tree
-            if update_refs:
-                state.refs = snapshot.refs
-            tree = snapshot.tree
-            return f"{label}\n{tree}" if label else tree
-
-        async def build_root(label: Optional[str] = None, update_refs: bool = False) -> str:
-            try:
-                snapshot = await get_enhanced_snapshot(
-                    state.page,
-                    options,
-                    timeout_ms=snapshot_timeout_ms,
-                )
-            except PlaywrightTimeoutError:
-                tree = f"[timeout after {snapshot_timeout_ms}ms]"
-                return f"{label}\n{tree}" if label else tree
-            if update_refs:
-                state.refs = snapshot.refs
-            tree = snapshot.tree
-            return f"{label}\n{tree}" if label else tree
-
-        if selector is None:
-            if not path:
-                raise ValueError("需要 path 或 selector")
-            tokens = [p for p in re.split(r"[,\s]+", path.strip()) if p]
-            paths = []
-            for token in tokens:
-                cleaned = self._normalize_path(token)
-                if cleaned:
-                    paths.append(cleaned)
-            if not paths:
-                raise ValueError("需要有效的 path 或 selector")
-            if len(paths) == 1:
-                target_path = paths[0]
-                if target_path in {"0", "root"}:
-                    return await build_root(update_refs=True)
-                locator = await self._resolve_path_locator(state, target_path)
-                return await build_tree(locator, update_refs=True, target_path=target_path)
-            sections: list[str] = []
-            for target_path in paths:
-                if target_path in {"0", "root"}:
-                    tree = await build_root()
-                else:
-                    locator = await self._resolve_path_locator(state, target_path)
-                    tree = await build_tree(locator, target_path=target_path)
-                sections.append(f"section (path={target_path})\n{tree}")
-            return "\n\n".join(sections)
-        locator = state.page.locator(selector)
-        count = await locator.count()
-        if count == 0:
-            raise ValueError(f"Selector matched no elements: {selector}")
-        if count == 1:
-            return await build_tree(locator, update_refs=True)
-        sections: list[str] = []
-        for index in range(count):
-            label = f"section (selector={selector}#{index + 1})"
-            sections.append(await build_tree(locator.nth(index), label=label))
-        note = f'Note: selector "{selector}" matched {count} elements; rendering in order.'
-        return "\n".join([note, "", *sections])
+        return "\n".join([header, *results])
 
     def _resolve_ref_locator(self, state: PageState, ref_id: str):
         if ref_id not in state.refs:

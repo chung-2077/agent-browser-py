@@ -202,7 +202,7 @@ async def cli() -> None:
                     print(await browser.get_title(page_id))
                 elif command == "snapshot":
                     page_id = await require_page()
-                    snapshot_tree = await browser.snapshot(page_id, interactive=False,compact=True)
+                    snapshot_tree = await browser.snapshot(page_id, interactive=False,max_depth=3,compact=True)
                     print(snapshot_tree)
                 elif command == "click":
                     page_id = await require_page()

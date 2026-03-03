@@ -27,6 +27,8 @@ class SnapshotOptions:
     max_depth: Optional[int] = None
     compact: bool = False
     selector: Optional[str] = None
+    text_limit: Optional[int] = None
+    summary: bool = False
 
 
 INTERACTIVE_ROLES = {
@@ -922,6 +924,14 @@ def _build_snapshot_from_aria_tree(aria_tree: str, options: SnapshotOptions) -> 
         is_content = role_lower in CONTENT_ROLES
         is_structural = role_lower in STRUCTURAL_ROLES
 
+        if options.summary:
+            keep = is_interactive or role_lower == "heading" or role_lower in {
+                "region", "main", "navigation", "article", "complementary", "banner", "contentinfo"
+            }
+            if not keep:
+                parsed_lines.append((None, None))
+                continue
+
         if options.interactive and not is_interactive:
             parsed_lines.append((None, None))
             continue
@@ -955,7 +965,10 @@ def _build_snapshot_from_aria_tree(aria_tree: str, options: SnapshotOptions) -> 
 
         line = f'{prefix}{role}'
         if name:
-            line += f' "{name}"'
+            display_name = name
+            if options.text_limit is not None:
+                display_name = _truncate_text(name, options.text_limit)
+            line += f' "{display_name}"'
 
         if should_have_ref:
             ref_index += 1
