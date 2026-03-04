@@ -1,6 +1,7 @@
 from typing import Any, Callable, Dict, List, Optional
-from agent import AgentBrowser
-import logger
+from .agent import AgentBrowser
+import logging
+logger = logging.getLogger(__name__)
 try:
     from agno.tools import Toolkit 
 except ImportError:
