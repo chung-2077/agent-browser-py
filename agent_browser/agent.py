@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import shutil
 import tempfile
@@ -26,6 +27,8 @@ from .snapshot import EnhancedSnapshot, SnapshotOptions, get_enhanced_snapshot, 
 from .storage import cookies_clear, cookies_get, cookies_set, storage_clear, storage_get, storage_set
 from .streaming import StreamServer
 
+
+logger = logging.getLogger(__name__)
 
 def build_llm_method_tutorial(method_names: Iterable[str]) -> str:
     """
@@ -951,6 +954,7 @@ class AgentBrowser:
         headless: bool = True,
         viewport: tuple[int, int] = (1282, 1783),
         user_agent: Optional[str] = None,
+        is_work: bool = True,
         timeout_ms: int = 10000,
         open_timeout_ms: int = 15000,
         locale: Optional[str] = None,
@@ -969,6 +973,7 @@ class AgentBrowser:
             headless: Whether to run the browser in headless mode.
             viewport: Default viewport size as (width, height).
             user_agent: Custom user agent string for the browser context.
+            is_work: Whether this instance is a worker using a cloned profile.
             timeout_ms: Default timeout (ms) for Playwright operations.
             open_timeout_ms: Timeout (ms) for open() navigation.
             locale: Browser context locale.
@@ -984,6 +989,7 @@ class AgentBrowser:
         self._headless = headless
         self._viewport = viewport
         self._user_agent = user_agent
+        self._is_work = is_work
         self._timeout_ms = timeout_ms
         self._open_timeout_ms = open_timeout_ms
         self._locale = locale
@@ -1033,6 +1039,26 @@ class AgentBrowser:
             self._temp_profile_dir = tempfile.mkdtemp(prefix="agent-browser-profile-")
             profile_dir = self._temp_profile_dir
         
+        # If this is a worker instance and a primary profile is provided,
+        # clone it to a temporary working profile to avoid collisions while sharing state.
+        if profile_dir and self._is_work:
+            work_dir = tempfile.mkdtemp(prefix="agent-browser-work-")
+            try:
+                logger.warning("Cloning primary profile to working directory: %s -> %s", profile_dir, work_dir)
+            except Exception:
+                pass
+            try:
+                self._clone_profile_dir(profile_dir, work_dir)
+                profile_dir = work_dir
+                self._temp_profile_dir = work_dir
+            except Exception as e:
+                try:
+                    logger.warning("Clone profile failed, continue with empty work dir %s: %s", work_dir, e)
+                except Exception:
+                    pass
+                profile_dir = work_dir
+                self._temp_profile_dir = work_dir
+        
         # If a profile directory is specified, use launch_persistent_context to maintain user data (cookies, etc.)
         use_persistent_context = bool(profile_dir)
 
@@ -1063,10 +1089,30 @@ class AgentBrowser:
             # Merge context_kwargs into launch_kwargs for persistent context
             launch_kwargs.update(context_kwargs)
             
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                user_data_dir=profile_dir,
-                **launch_kwargs
-            )
+            try:
+                self._context = await self._playwright.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    **launch_kwargs
+                )
+            except Exception as e:
+                message = str(e)
+                if (
+                    "ProcessSingleton" in message
+                    or "profile directory" in message
+                    or "SingletonLock" in message
+                ):
+                    self._temp_profile_dir = tempfile.mkdtemp(prefix="agent-browser-profile-")
+                    alt_profile_dir = self._temp_profile_dir
+                    try:
+                        logger.warning("Profile in use, falling back to temp profile: %s", alt_profile_dir)
+                    except Exception:
+                        pass
+                    self._context = await self._playwright.chromium.launch_persistent_context(
+                        user_data_dir=alt_profile_dir,
+                        **launch_kwargs
+                    )
+                else:
+                    raise
             self._browser = None
         else:
             self._browser = await self._playwright.chromium.launch(**launch_kwargs)
@@ -1637,6 +1683,30 @@ class AgentBrowser:
         if self._temp_profile_dir:
             shutil.rmtree(self._temp_profile_dir, ignore_errors=True)
             self._temp_profile_dir = None
+
+    def _clone_profile_dir(self, src: str, dst: str) -> None:
+        ignore_dirs = {
+            "Crashpad", "Cache", "Code Cache", "Service Worker",
+            "ShaderCache", "GPUCache", "GrShaderCache", "DawnCache",
+            "blob_storage", "File System", "Service Worker", "Media Cache",
+            "BudgetDatabase", "Safe Browsing", "Safe Browsing Network",
+        }
+        ignore_files_prefix = ("Singleton", "LOCK", "LOCKFILE", "Running", ".com.google.Chrome")
+        os.makedirs(dst, exist_ok=True)
+        for entry in os.listdir(src):
+            if any(entry.startswith(p) for p in ignore_files_prefix):
+                continue
+            src_path = os.path.join(src, entry)
+            dst_path = os.path.join(dst, entry)
+            if os.path.isdir(src_path):
+                if entry in ignore_dirs:
+                    continue
+                shutil.copytree(src_path, dst_path, symlinks=True, dirs_exist_ok=True)
+            else:
+                try:
+                    shutil.copy2(src_path, dst_path)
+                except Exception:
+                    pass
 
     def _get_state(self, page_id: str) -> PageState:
         if page_id not in self._pages:
