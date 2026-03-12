@@ -65,10 +65,14 @@ class AgentBrowserToolkit(Toolkit):
         Returns:
             A page_id string that identifies the opened page in this AgentBrowser instance.
         """
-        page_id = await self._browser.open(url)
-        self._touch_page(page_id)
-        await self._evict_if_needed()
-        return page_id
+        try:
+            page_id = await self._browser.open(url)
+            self._touch_page(page_id)
+            await self._evict_if_needed()
+            return page_id
+        except Exception as exc:
+            logger.error(f"open error: {exc}", exc_info=True)
+            return str(exc)
 
     def _touch_page(self, page_id: str) -> None:
         if page_id in self._page_lru:
@@ -110,14 +114,18 @@ class AgentBrowserToolkit(Toolkit):
         Returns:
             Human-readable accessibility tree text.
         """
-        s = await self._browser.snapshot(
-            page_id,
-            interactive=interactive,
-            max_depth=max_depth,
-            compact=compact,
-            selector=selector,
-        )
-        return s
+        try:
+            s = await self._browser.snapshot(
+                page_id,
+                interactive=interactive,
+                max_depth=max_depth,
+                compact=compact,
+                selector=selector,
+            )
+            return s
+        except Exception as exc:
+            logger.error(f"snapshot error: {exc}", exc_info=True)
+            return str(exc)
 
     async def snapshot_index(
         self,
@@ -131,10 +139,14 @@ class AgentBrowserToolkit(Toolkit):
             page_id: Target page id returned by open().
             text_limit: Max length for node labels.
         """
-        return await self._browser.snapshot_index(
-            page_id,
-            text_limit=text_limit,
-        )
+        try:
+            return await self._browser.snapshot_index(
+                page_id,
+                text_limit=text_limit,
+            )
+        except Exception as exc:
+            logger.error(f"snapshot_index error: {exc}", exc_info=True)
+            return str(exc)
 
     async def snapshot_search(
         self,
@@ -155,13 +167,17 @@ class AgentBrowserToolkit(Toolkit):
             text_limit: Max length for node labels.
 
         """
-        return await self._browser.snapshot_search(
-            page_id,
-            query=query,
-            mode=mode,
-            limit=limit,
-            text_limit=text_limit,
-        )
+        try:
+            return await self._browser.snapshot_search(
+                page_id,
+                query=query,
+                mode=mode,
+                limit=limit,
+                text_limit=text_limit,
+            )
+        except Exception as exc:
+            logger.error(f"snapshot_search error: {exc}", exc_info=True)
+            return str(exc)
 
     async def get_url(self, page_id: str) -> str:
         """
@@ -173,7 +189,11 @@ class AgentBrowserToolkit(Toolkit):
         Returns:
             The current page URL.
         """
-        return await self._browser.get_url(page_id)
+        try:
+            return await self._browser.get_url(page_id)
+        except Exception as exc:
+            logger.error(f"get_url error: {exc}", exc_info=True)
+            return str(exc)
 
     async def get_title(self, page_id: str) -> str:
         """
@@ -185,7 +205,11 @@ class AgentBrowserToolkit(Toolkit):
         Returns:
             The page title string.
         """
-        return await self._browser.get_title(page_id)
+        try:
+            return await self._browser.get_title(page_id)
+        except Exception as exc:
+            logger.error(f"get_title error: {exc}", exc_info=True)
+            return str(exc)
 
     async def click(self, page_id: str, selector_or_ref: str) -> Dict[str, Any]:
         """
@@ -198,7 +222,11 @@ class AgentBrowserToolkit(Toolkit):
         Returns:
             A dict describing what happened (url change, popup, download).
         """
-        return await self._browser.click(page_id, selector_or_ref)
+        try:
+            return await self._browser.click(page_id, selector_or_ref)
+        except Exception as exc:
+            logger.error(f"click error: {exc}", exc_info=True)
+            return str(exc)
 
     async def back(self, page_id: str, steps: int = 1) -> Dict[str, Any]:
         """
@@ -211,7 +239,11 @@ class AgentBrowserToolkit(Toolkit):
         Returns:
             A dict describing whether the page navigated back and the current URL.
         """
-        return await self._browser.back(page_id, steps=steps)
+        try:
+            return await self._browser.back(page_id, steps=steps)
+        except Exception as exc:
+            logger.error(f"back error: {exc}", exc_info=True)
+            return str(exc)
 
     async def fill(self, page_id: str, selector_or_ref: str, text: str) -> None:
         """
@@ -225,7 +257,11 @@ class AgentBrowserToolkit(Toolkit):
         Returns:
             A dict describing what happened, including the resulting value.
         """
-        return await self._browser.fill(page_id, selector_or_ref, text)
+        try:
+            return await self._browser.fill(page_id, selector_or_ref, text)
+        except Exception as exc:
+            logger.error(f"fill error: {exc}", exc_info=True)
+            return str(exc)
 
     async def press(self, page_id: str, selector_or_ref: str, key: str) -> Dict[str, Any]:
         """
@@ -239,7 +275,11 @@ class AgentBrowserToolkit(Toolkit):
         Returns:
             A dict describing what happened (e.g. url change).
         """
-        return await self._browser.press(page_id, selector_or_ref, key)
+        try:
+            return await self._browser.press(page_id, selector_or_ref, key)
+        except Exception as exc:
+            logger.error(f"press error: {exc}", exc_info=True)
+            return str(exc)
 
     async def select(self, page_id: str, selector_or_ref: str, value: str) -> None:
         """
@@ -253,7 +293,11 @@ class AgentBrowserToolkit(Toolkit):
         Returns:
             A dict describing what happened, including the resulting value.
         """
-        return await self._browser.select(page_id, selector_or_ref, value)
+        try:
+            return await self._browser.select(page_id, selector_or_ref, value)
+        except Exception as exc:
+            logger.error(f"select error: {exc}", exc_info=True)
+            return str(exc)
 
     async def check(self, page_id: str, selector_or_ref: str) -> None:
         """
@@ -266,7 +310,11 @@ class AgentBrowserToolkit(Toolkit):
         Returns:
             A dict describing what happened, including current checked state.
         """
-        return await self._browser.check(page_id, selector_or_ref)
+        try:
+            return await self._browser.check(page_id, selector_or_ref)
+        except Exception as exc:
+            logger.error(f"check error: {exc}", exc_info=True)
+            return str(exc)
 
     async def uncheck(self, page_id: str, selector_or_ref: str) -> None:
         """
@@ -279,7 +327,11 @@ class AgentBrowserToolkit(Toolkit):
         Returns:
             A dict describing what happened, including current checked state.
         """
-        return await self._browser.uncheck(page_id, selector_or_ref)
+        try:
+            return await self._browser.uncheck(page_id, selector_or_ref)
+        except Exception as exc:
+            logger.error(f"uncheck error: {exc}", exc_info=True)
+            return str(exc)
 
     async def upload(self, page_id: str, selector_or_ref: str, files: List[str]) -> None:
         """
@@ -293,7 +345,11 @@ class AgentBrowserToolkit(Toolkit):
         Returns:
             A dict describing what happened.
         """
-        return await self._browser.upload(page_id, selector_or_ref, files)
+        try:
+            return await self._browser.upload(page_id, selector_or_ref, files)
+        except Exception as exc:
+            logger.error(f"upload error: {exc}", exc_info=True)
+            return str(exc)
 
     async def solve_cf(self, page_id: str) -> bool:
         """
@@ -302,7 +358,11 @@ class AgentBrowserToolkit(Toolkit):
         Args:
             page_id: Target page id returned by open().
         """
-        return await self._browser.solve_cloudflare_captcha(page_id)
+        try:
+            return await self._browser.solve_cloudflare_captcha(page_id)
+        except Exception as exc:
+            logger.error(f"solve_cf error: {exc}", exc_info=True)
+            return str(exc)
 
 
     async def inner_html(self, page_id: str, selector_or_ref: str) -> str:
@@ -316,7 +376,11 @@ class AgentBrowserToolkit(Toolkit):
         Returns:
             The element's innerHTML.
         """
-        return await self._browser.inner_html(page_id, selector_or_ref)
+        try:
+            return await self._browser.inner_html(page_id, selector_or_ref)
+        except Exception as exc:
+            logger.error(f"inner_html error: {exc}", exc_info=True)
+            return str(exc)
 
     async def find(
         self,
@@ -352,16 +416,19 @@ class AgentBrowserToolkit(Toolkit):
         Returns:
             A dict describing the action result.
         """
-        return await self._browser.find(
-            page_id,
-            strategy=strategy,
-            value=value,
-            name=name,
-            selector=selector,
-            nth=nth,
-            action=action,
-            action_value=action_value,
-            files=files,
-        )
-
+        try:
+            return await self._browser.find(
+                page_id,
+                strategy=strategy,
+                value=value,
+                name=name,
+                selector=selector,
+                nth=nth,
+                action=action,
+                action_value=action_value,
+                files=files,
+            )
+        except Exception as exc:
+            logger.error(f"find error: {exc}", exc_info=True)
+            return str(exc)
 
