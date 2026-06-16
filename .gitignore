@@ -8,5 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# Project specific
 /frames/
 /*.png
